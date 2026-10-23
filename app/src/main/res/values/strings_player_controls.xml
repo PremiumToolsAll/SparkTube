@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="collapse_video_player">Collapse to mini player</string>
+    <string name="switch_to_audio">Video active. Switch to audio</string>
+    <string name="switch_to_video">Audio active. Switch to video</string>
+    <string name="switch_video_unavailable">No video is available for this audio file.</string>
+    <string name="gesture_volume">Volume %1$d%%</string>
+    <string name="gesture_brightness">Brightness %1$d%%</string>
+    <string name="gesture_seek_forward">+10 seconds</string>
+    <string name="gesture_seek_back">−10 seconds</string>
+</resources>

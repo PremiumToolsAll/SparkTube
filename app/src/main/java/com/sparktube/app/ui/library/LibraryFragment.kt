@@ -4,17 +4,22 @@ import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.view.MotionEvent
+import android.os.Handler
+import android.os.Looper
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.core.view.isVisible
 import androidx.fragment.app.Fragment
 import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.tabs.TabLayout
 import com.sparktube.app.R
 import com.sparktube.app.data.LocalStore
 import com.sparktube.app.databinding.FragmentLibraryBinding
 import com.sparktube.app.download.DownloadCenter
 import com.sparktube.app.playback.PlaybackCenter
+import com.sparktube.app.playback.QueueEntry
 import com.sparktube.app.ui.channel.ChannelActivity
 import com.sparktube.app.ui.common.ChannelRowAdapter
 import com.sparktube.app.ui.common.DownloadAdapter
@@ -24,6 +29,8 @@ import com.sparktube.app.ui.common.toEntry
 import com.sparktube.app.ui.common.toUiModel
 import com.sparktube.app.ui.player.PlayerActivity
 import com.sparktube.app.ui.playlist.PlaylistActivity
+import com.sparktube.app.ui.music.AudioDownloadLibrary
+import com.sparktube.app.ui.music.NowPlayingActivity
 
 /**
  * Library: History, Favorites, Subscriptions, Downloads and Playlists tabs.
@@ -40,6 +47,12 @@ class LibraryFragment : Fragment() {
     private lateinit var playlistAdapter: PlaylistAdapter
 
     private var tab = TAB_HISTORY
+    private val uiHandler = Handler(Looper.getMainLooper())
+    private val refreshDownloads = object : Runnable {
+        override fun run() { if (_binding != null && tab == TAB_DOWNLOADS) { refresh(); uiHandler.postDelayed(this, 1000) } }
+    }
+    private var downX = 0f
+    private var downY = 0f
 
     override fun onCreateView(
         inflater: LayoutInflater,
@@ -78,8 +91,15 @@ class LibraryFragment : Fragment() {
             }
         )
         downloadAdapter = DownloadAdapter(
-            onClick = { record -> PlaybackCenter.playDownload(record) },
-            onLongClick = { record -> confirmDelete(record) }
+            onClick = { record -> openDownload(record) },
+            onLongClick = { record -> confirmDelete(record) },
+            onPause = { record ->
+                if (record.status != DownloadCenter.STATUS_PAUSED) AlertDialog.Builder(requireContext())
+                    .setMessage(R.string.download_process_limit).setPositiveButton(android.R.string.ok) { _, _ ->
+                        DownloadCenter.togglePause(requireContext(), record); refresh()
+                    }.setNegativeButton(android.R.string.cancel, null).show()
+                else { DownloadCenter.togglePause(requireContext(), record); refresh() }
+            }
         )
         playlistAdapter = PlaylistAdapter(
             onClick = { playlist ->
@@ -94,7 +114,9 @@ class LibraryFragment : Fragment() {
         binding.tabs.addOnTabSelectedListener(object : TabLayout.OnTabSelectedListener {
             override fun onTabSelected(tab: TabLayout.Tab) {
                 this@LibraryFragment.tab = tab.position
+                uiHandler.removeCallbacks(refreshDownloads)
                 refresh()
+                if (tab.position == TAB_DOWNLOADS) uiHandler.post(refreshDownloads)
             }
 
             override fun onTabUnselected(tab: TabLayout.Tab) = Unit
@@ -102,16 +124,53 @@ class LibraryFragment : Fragment() {
         })
 
         binding.tabs.selectTab(binding.tabs.getTabAt(tab))
+        binding.list.addOnItemTouchListener(object : RecyclerView.SimpleOnItemTouchListener() {
+            private var switched = false
+            override fun onInterceptTouchEvent(rv: RecyclerView, event: MotionEvent): Boolean {
+                when (event.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> { downX = event.x; downY = event.y; switched = false }
+                    MotionEvent.ACTION_MOVE -> {
+                        val dx = event.x - downX
+                        val dy = event.y - downY
+                        val threshold = 56 * resources.displayMetrics.density
+                        if (!switched && kotlin.math.abs(dx) > threshold && kotlin.math.abs(dx) > kotlin.math.abs(dy) * 1.4f) {
+                            switched = true
+                            val direction = if (rv.layoutDirection == View.LAYOUT_DIRECTION_RTL) -1 else 1
+                            val next = (this@LibraryFragment.tab + (if (dx < 0) direction else -direction)).coerceIn(TAB_HISTORY, TAB_PLAYLISTS)
+                            binding.tabs.getTabAt(next)?.select()
+                            return true
+                        }
+                    }
+                }
+                return false
+            }
+        })
+    }
+
+    fun showDownloadsTab() {
+        if (_binding == null) return
+        binding.tabs.getTabAt(TAB_DOWNLOADS)?.select()
+        refresh()
+        uiHandler.removeCallbacks(refreshDownloads)
+        uiHandler.post(refreshDownloads)
     }
 
     override fun onResume() {
         super.onResume()
         refresh()
+        uiHandler.removeCallbacks(refreshDownloads)
+        if (tab == TAB_DOWNLOADS) uiHandler.post(refreshDownloads)
     }
+
+    override fun onPause() { uiHandler.removeCallbacks(refreshDownloads); super.onPause() }
 
     override fun onHiddenChanged(hidden: Boolean) {
         super.onHiddenChanged(hidden)
-        if (!hidden) refresh()
+        uiHandler.removeCallbacks(refreshDownloads)
+        if (!hidden) {
+            refresh()
+            if (tab == TAB_DOWNLOADS) uiHandler.post(refreshDownloads)
+        }
     }
 
     private fun refresh() {
@@ -144,12 +203,37 @@ class LibraryFragment : Fragment() {
     private fun bindDownloads() {
         val context = context ?: return
         DownloadCenter.refreshStatuses(context)
-        // Music downloads live on the Music page, not here.
-        val downloads = LocalStore.videoDownloads(context)
-        binding.list.adapter = downloadAdapter
-        downloadAdapter.submitList(downloads)
+        // Include audio too so every transfer can be paused, resumed and shared here.
+        val downloads = LocalStore.downloads(context)
+        if (binding.list.adapter !== downloadAdapter) binding.list.adapter = downloadAdapter
+        downloadAdapter.submitList(downloads) { downloadAdapter.refreshLiveMetrics() }
         binding.emptyView.setText(R.string.empty_downloads)
         binding.emptyView.isVisible = downloads.isEmpty()
+    }
+
+    private fun openDownload(record: com.sparktube.app.data.DownloadRecord) {
+        if (record.type != DownloadCenter.TYPE_AUDIO) {
+            PlaybackCenter.playDownload(record)
+            return
+        }
+        val playable = AudioDownloadLibrary.playable(listOf(record)).firstOrNull()
+        if (playable == null) {
+            Toast.makeText(requireContext(), R.string.download_file_missing, Toast.LENGTH_SHORT).show()
+            return
+        }
+        val (audio, path) = playable
+        PlaybackCenter.playMusicQueue(
+            listOf(QueueEntry(
+                url = "file://$path",
+                title = audio.title,
+                uploader = audio.uploader,
+                thumbnailUrl = audio.thumbnailUrl,
+                durationSec = 0L,
+                isMusic = true
+            )),
+            0
+        )
+        NowPlayingActivity.start(requireContext())
     }
 
     private fun bindPlaylists() {
@@ -188,6 +272,7 @@ class LibraryFragment : Fragment() {
     }
 
     override fun onDestroyView() {
+        uiHandler.removeCallbacks(refreshDownloads)
         super.onDestroyView()
         _binding = null
     }

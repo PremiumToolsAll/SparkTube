@@ -17,6 +17,7 @@ import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.ResolvingDataSource
+import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
@@ -185,6 +186,9 @@ object PlaybackCenter {
         fun onCatalogReady() {}
         fun onPlaybackStateChanged(isPlaying: Boolean) {}
         fun onQueueChanged() {}
+        fun onSleepTimerChanged() {}
+        fun onSleepTimerExpired() {}
+        fun onVideoFrameRendered() {}
         fun onError(message: String) {}
 
         /** A resolved item turned out to be live content — see [LiveContentException]. */
@@ -210,7 +214,75 @@ object PlaybackCenter {
     private const val RADIO_REFILL_BELOW = 10
     private const val RADIO_MIN_UPCOMING = 15
     private var playerRef: ExoPlayer? = null
+    private val sleepTimer = SleepTimerState()
+    private var sleepTimerJob: Job? = null
+    private val timerHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val timerAlarm = android.app.AlarmManager.OnAlarmListener { checkSleepTimer() }
+    val sleepTimerMode: SleepTimerState.Mode get() = sleepTimer.mode
+    var sleepTimerMinutes: Int = 0
+        private set
+    val sleepTimerRemainingMs: Long? get() = sleepTimer.remainingMs(SystemClock.elapsedRealtime())
+
+    /** Shared timer survives page collapse, mode changes, pause and background playback. */
+    fun setSleepTimer(minutes: Int) {
+        require(minutes in listOf(10, 15, 20, 30, 45, 60))
+        clearSleepTimer()
+        sleepTimer.setDuration(minutes, SystemClock.elapsedRealtime())
+        sleepTimerMinutes = minutes
+        // Listener alarms need no exact-alarm permission and wake the live playback process.
+        // The monotonic coroutine is also retained as a foreground/service fallback.
+        try {
+            val alarms = appContext.getSystemService(Context.ALARM_SERVICE) as android.app.AlarmManager
+            alarms.setExact(android.app.AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                sleepTimer.deadlineMs!!, "SparkTube sleep timer", timerAlarm, timerHandler)
+        } catch (_: SecurityException) { /* OEM restriction: service ticker still checks. */ }
+        sleepTimerJob = scope.launch {
+            while (isActive && sleepTimer.mode == SleepTimerState.Mode.DURATION) {
+                if (checkSleepTimer()) break
+                delay(minOf(sleepTimerRemainingMs ?: 1000L, 1000L).coerceAtLeast(1L))
+            }
+        }
+        notify { it.onSleepTimerChanged() }
+    }
+
+    fun setSleepTimerEndOfItem() {
+        if (!hasMedia) return
+        clearSleepTimer()
+        sleepTimer.setEndOfItem(currentEntry?.url)
+        // Pause before the native music playlist can start its next item.
+        applyMusicAutoplay()
+        notify { it.onSleepTimerChanged() }
+        if (playerRef?.playbackState == Player.STATE_ENDED) expireSleepTimer()
+    }
+
+    fun clearSleepTimer() {
+        sleepTimerJob?.cancel()
+        sleepTimerJob = null
+        if (this::appContext.isInitialized) {
+            (appContext.getSystemService(Context.ALARM_SERVICE) as android.app.AlarmManager).cancel(timerAlarm)
+        }
+        sleepTimer.clear()
+        sleepTimerMinutes = 0
+        applyMusicAutoplay()
+        notify { it.onSleepTimerChanged() }
+    }
+
+    private fun checkSleepTimer(): Boolean {
+        if (!sleepTimer.isExpired(SystemClock.elapsedRealtime())) return false
+        expireSleepTimer()
+        return true
+    }
+
+    private fun expireSleepTimer() {
+        // Cancel resolving/watchdogs as well: a pending network result must not restart playback.
+        stopPlayback()
+        notify { it.onSleepTimerExpired() }
+    }
+
     private var resolveJob: Job? = null
+    private val pendingVideo = PendingPlaybackRequest()
+    private val videoRequestPending: Boolean
+        get() = mode == Mode.VIDEO && pendingVideo.active
 
     // ----- Startup watchdog (auto quality downshift) -----
 
@@ -223,6 +295,9 @@ object PlaybackCenter {
      * stalls right after starting, it drops ONE quality tier and rebuilds the
      * source (keeping the position mid-play) until playback actually flows.
      */
+    private var frameWatchJob: Job? = null
+    private var videoFrameSeen = false
+    private var frameRecoveryStep = 0
     private var watchdogJob: Job? = null
     private var watchdogDownshifts = 0
 
@@ -276,7 +351,15 @@ object PlaybackCenter {
 
     @Volatile var mode: Mode = Mode.NONE
         private set
-    @Volatile var inPip: Boolean = false
+    private val pipSession = PipSessionState<PlayerView>()
+    val inPip: Boolean get() = pipSession.active
+
+    fun setPipState(view: PlayerView, active: Boolean, onClose: () -> Unit = {}) {
+        if (active) pipSession.claim(view, onClose) else pipSession.release(view)
+    }
+
+    /** Explicit playback/page replacement only; automatic queue advance keeps PiP alive. */
+    fun closePreviousPip() = pipSession.close()
     @Volatile var audioOnlyMode: Boolean = false
         private set
 
@@ -353,7 +436,7 @@ object PlaybackCenter {
     val player: ExoPlayer
         get() {
             check(this::appContext.isInitialized) { "PlaybackCenter.init() not called" }
-            return playerRef ?: ExoPlayer.Builder(appContext)
+            return playerRef ?: ExoPlayer.Builder(appContext, DefaultRenderersFactory(appContext).setEnableDecoderFallback(true))
                 // IMPORTANT: player.setMediaItems() (music playlist!) builds
                 // its MediaSources through this factory. Without it the
                 // player falls back to its own default data source chain,
@@ -398,15 +481,40 @@ object PlaybackCenter {
                 }
         }
 
+    /** Stable facade for the media session and in-app player controls. */
+    val sessionPlayer: Player
+        get() {
+            val raw = player
+            return forwardingPlayer?.takeIf { forwardingFor === raw }
+                ?: QueueForwardingPlayer(raw).also {
+                    forwardingPlayer = it
+                    forwardingFor = raw
+                }
+        }
+
     private val playerListener = object : Player.Listener {
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             notify { it.onPlaybackStateChanged(isPlaying) }
         }
 
+        override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+            if (!playWhenReady && reason == Player.PLAY_WHEN_READY_CHANGE_REASON_END_OF_MEDIA_ITEM &&
+                sleepTimer.shouldStopAtEnd(currentEntry?.url)) {
+                expireSleepTimer()
+                return
+            }
+            notify { it.onPlaybackStateChanged(isPlaying) }
+        }
+
         override fun onPlaybackStateChanged(playbackState: Int) {
+            if (playbackState == Player.STATE_ENDED && sleepTimer.shouldStopAtEnd(currentEntry?.url)) {
+                expireSleepTimer()
+                return
+            }
+            notify { it.onPlaybackStateChanged(isPlaying) }
             // A playlist always continues to its next video (like YouTube);
             // the autoplay setting only governs the related-videos queue.
-            if (playbackState == Player.STATE_ENDED && mode == Mode.VIDEO &&
+            if (!videoRequestPending && playbackState == Player.STATE_ENDED && mode == Mode.VIDEO &&
                 (playlistMode || AppPrefs.videoAutoplayNext)
             ) {
                 advance()
@@ -415,6 +523,11 @@ object PlaybackCenter {
 
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
             if (mode != Mode.AUDIO) return
+            if (sleepTimer.shouldStopOnTransition(currentEntry?.url,
+                    reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO || reason == Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT)) {
+                expireSleepTimer()
+                return
+            }
             val index = playerRef?.currentMediaItemIndex ?: return
             if (index < 0 || index >= queue.size) return
             queueIndex = index
@@ -429,10 +542,22 @@ object PlaybackCenter {
         }
 
         override fun onPlayerError(error: PlaybackException) {
-            onPlayerFailed(error)
+            // A paused outgoing source can still fail while the next URL resolves.
+            if (!videoRequestPending) onPlayerFailed(error)
+        }
+
+        override fun onTracksChanged(tracks: androidx.media3.common.Tracks) {
+            android.util.Log.i("SparkTubeVideo", "tracks videoSelected=${tracks.isTypeSelected(C.TRACK_TYPE_VIDEO)} videoSupported=${tracks.isTypeSupported(C.TRACK_TYPE_VIDEO)} adaptive=$dashActive")
+        }
+
+        override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
+            android.util.Log.i("SparkTubeVideo", "size=${videoSize.width}x${videoSize.height}")
         }
 
         override fun onRenderedFirstFrame() {
+            videoFrameSeen = true
+            frameWatchJob?.cancel()
+            notify { it.onVideoFrameRendered() }
             if (mode != Mode.VIDEO || sourceAppliedAt == 0L) return
             val ms = SystemClock.elapsedRealtime() - sourceAppliedAt
             android.util.Log.i("SparkTubeStartup", "first frame after ${ms}ms (adaptive=$dashActive)")
@@ -449,6 +574,12 @@ object PlaybackCenter {
     }
 
     private fun notify(block: (Listener) -> Unit) {
+        // An explicit new item cancels only end-of-item; timed countdown spans the queue.
+        if (sleepTimer.mode == SleepTimerState.Mode.END_OF_ITEM &&
+            !sleepTimer.shouldStopAtEnd(currentEntry?.url)) {
+            clearSleepTimer()
+        }
+        forwardingPlayer?.refreshSessionState()
         val snapshot = listeners.toList()
         snapshot.forEach(block)
     }
@@ -485,6 +616,8 @@ object PlaybackCenter {
 
     /** Kills the current playback instantly so sounds never overlap. */
     private fun stopPlayerNow() {
+        pendingVideo.cancel()
+        retainedVideoSourceForAudio = false
         playerRef?.run {
             stop()
             clearMediaItems()
@@ -496,6 +629,7 @@ object PlaybackCenter {
     /** Starts a video (watch page). Builds a YouTube-like autoplay queue. */
     fun playVideo(entry: QueueEntry, extraQueue: List<QueueEntry> = emptyList()) {
         initFromApp()
+        closePreviousPip()
         stopPlayerNow()
         mode = Mode.VIDEO
         radioMode = false
@@ -514,6 +648,7 @@ object PlaybackCenter {
     fun playPlaylist(entries: List<QueueEntry>, startIndex: Int = 0) {
         initFromApp()
         if (entries.isEmpty()) return
+        closePreviousPip()
         stopPlayerNow()
         mode = Mode.VIDEO
         radioMode = false
@@ -537,6 +672,7 @@ object PlaybackCenter {
     fun playMusicQueue(entries: List<QueueEntry>, startIndex: Int = 0, allowRadio: Boolean = false) {
         initFromApp()
         if (entries.isEmpty()) return
+        closePreviousPip()
         val start = startIndex.coerceIn(0, entries.size - 1)
         // The player playlist is the tapped song + everything after it, so
         // player indexes and queue indexes always match.
@@ -611,12 +747,10 @@ object PlaybackCenter {
     }
 
     fun togglePlayPause() {
-        val p = playerRef ?: return
-        if (p.isPlaying) {
-            p.pause()
-        } else {
-            p.play()
-        }
+        if (playerRef == null) return
+        val p = sessionPlayer
+        // isPlaying is false during buffering; toggle the user's intent instead.
+        if (p.playWhenReady) p.pause() else p.play()
     }
 
     fun seekTo(positionMs: Long) {
@@ -628,6 +762,23 @@ object PlaybackCenter {
     val isPlaying: Boolean get() = playerRef?.isPlaying ?: false
     val isBuffering: Boolean get() = playerRef?.playbackState == Player.STATE_BUFFERING
 
+    /** Retry the current item without discarding the user's queue or resolving a file URL online. */
+    fun retryCurrentVideo() {
+        val entry = currentEntry ?: return
+        if (mode != Mode.VIDEO) return
+        frameRecoveryStep = 0
+        if (entry.url.startsWith("file://")) {
+            val record = LocalStore.downloads(appContext).firstOrNull {
+                it.filePaths.firstOrNull()?.let { path -> "file://$path" == entry.url } == true
+            }
+            if (record == null || !startLocalFiles(record)) {
+                notify { it.onError("Downloaded file is missing") }
+            }
+        } else {
+            resolveCurrent()
+        }
+    }
+
     fun setSpeed(speed: Float) {
         playbackSpeed = speed
         playerRef?.setPlaybackSpeed(speed)
@@ -635,7 +786,7 @@ object PlaybackCenter {
 
     /** Music settings: pause between songs instead of auto-advancing. */
     fun applyMusicAutoplay() {
-        playerRef?.setPauseAtEndOfMediaItems(!AppPrefs.musicAutoplayNext)
+        playerRef?.setPauseAtEndOfMediaItems(sleepTimer.mode == SleepTimerState.Mode.END_OF_ITEM || !AppPrefs.musicAutoplayNext)
     }
 
     fun next() {
@@ -643,7 +794,7 @@ object PlaybackCenter {
             Mode.AUDIO -> playerRef?.run {
                 if (hasNextMediaItem()) seekToNextMediaItem()
             }
-            Mode.VIDEO -> if (queueIndex < queue.size - 1) {
+            Mode.VIDEO -> if (QueueNavigationPolicy.hasNext(queueIndex, queue.size)) {
                 queueIndex++
                 resolveCurrent()
             }
@@ -670,6 +821,11 @@ object PlaybackCenter {
     }
 
     fun stopPlayback() {
+        pendingVideo.cancel()
+        retainedVideoSourceForAudio = false
+        clearSleepTimer()
+        watchdogJob?.cancel()
+        frameWatchJob?.cancel()
         resolveJob?.cancel()
         prefetchJob?.cancel()
         pendingMusic.clear()
@@ -682,6 +838,7 @@ object PlaybackCenter {
         queue.clear()
         queueIndex = -1
         catalog = null
+        setResolving(false)
         notify { it.onQueueChanged() }
         notify { it.onItemChanged(null) }
         notify { it.onPlaybackStateChanged(false) }
@@ -703,6 +860,7 @@ object PlaybackCenter {
             // Explicit "Auto" beats the settings default for this session.
             autoPicked = height == null
         }
+        frameRecoveryStep = 0
         // Explicit user action: give adaptive streams another chance even
         // if an earlier error had dropped us to a muxed fallback.
         usedFallback = false
@@ -723,19 +881,54 @@ object PlaybackCenter {
         notify { it.onCatalogReady() }
     }
 
-    /** Turns the current video into an audio-only background stream. */
+    private var retainedVideoSourceForAudio = false
+
+    /** Instant presentation switch: retain the source, position and playback intent. */
     fun switchToAudioOnly() {
+        if (mode != Mode.VIDEO || audioOnlyMode) return
+        retainedVideoSourceForAudio = true
         audioOnlyMode = true
-        rebuildSource(keepPosition = true)
+        frameWatchJob?.cancel()
+        watchdogJob?.cancel()
+        // Only the screen changes. Do not stop/prepare/seek or replace the source.
         notify { it.onAudioOnlyChanged(true) }
     }
 
-    /** Rebuilds the full video source after background-audio mode. */
+    /** Reattach retained video immediately; rebuild only if an audio-only source was loaded later. */
     fun switchBackToVideo() {
         if (mode != Mode.VIDEO) return
         audioOnlyMode = false
+        frameRecoveryStep = 0
+        if (selectedHeight == -1) selectedHeight = null
+        if (retainedVideoSourceForAudio) {
+            retainedVideoSourceForAudio = false
+        } else {
+            rebuildSource(keepPosition = true)
+        }
+        notify { it.onAudioOnlyChanged(false) }
+    }
+
+    /** Convert an online music item to its video without resetting position or queue. */
+    suspend fun switchMusicToVideo(): Boolean {
+        val entry = currentEntry ?: return false
+        if (entry.url.startsWith("file://")) return false
+        val resolved = StreamCatalog(YtRepository.streamInfo(entry.url))
+        if (currentEntry?.url != entry.url || (resolved.videoOnly.isEmpty() && resolved.muxed.isEmpty())) return false
+        resolveJob?.cancel()
+        prefetchJob?.cancel()
+        mode = Mode.VIDEO
+        radioMode = false
+        playlistMode = true
+        audioOnlyMode = false
+        catalog = resolved
+        selectedHeight = null
+        selectedAudioTrackId = null
+        usedFallback = false
+        pendingMusic.clear()
         rebuildSource(keepPosition = true)
         notify { it.onAudioOnlyChanged(false) }
+        notify { it.onCatalogReady() }
+        return true
     }
 
     // ----- Favorites -----
@@ -757,6 +950,11 @@ object PlaybackCenter {
     fun playDownload(record: DownloadRecord) {
         initFromApp()
         if (record.filePaths.isEmpty()) return
+        resolveJob?.cancel()
+        pendingVideo.cancel()
+        setResolving(false)
+        frameWatchJob?.cancel()
+        frameRecoveryStep = 0
         mode = if (record.type == DownloadCenter.TYPE_AUDIO) Mode.AUDIO else Mode.VIDEO
         audioOnlyMode = record.type == DownloadCenter.TYPE_AUDIO
         radioMode = false
@@ -788,6 +986,7 @@ object PlaybackCenter {
 
     /** Prepares and starts the finished download's files on the player. False when none exist. */
     private fun startLocalFiles(record: DownloadRecord): Boolean {
+        retainedVideoSourceForAudio = false
         val sources = record.filePaths
             .filter { File(it).exists() }
             .map { path ->
@@ -797,12 +996,14 @@ object PlaybackCenter {
             }
         if (sources.isEmpty()) return false
         val source = if (sources.size == 1) sources[0] else MergingMediaSource(*sources.toTypedArray())
+        videoFrameSeen = false
         player.run {
             setMediaSource(source, 0L)
             prepare()
-            playWhenReady = true
+            playWhenReady = if (videoRequestPending) pendingVideo.playWhenReady else true
             setPlaybackSpeed(playbackSpeed)
         }
+        startFrameWatch()
         return true
     }
 
@@ -834,6 +1035,12 @@ object PlaybackCenter {
     private fun resolveCurrent() {
         val entry = currentEntry ?: return
         resolveJob?.cancel()
+        val requestToken = pendingVideo.begin()
+        // Acknowledge queue selection now, not after online stream extraction.
+        // The previous stream must not keep sounding like the newly selected item.
+        playerRef?.pause()
+        frameWatchJob?.cancel()
+        frameRecoveryStep = 0
         // A previous video's startup watchdog must not act on this one, and
         // its quality drop applies to that video only.
         watchdogJob?.cancel()
@@ -885,7 +1092,8 @@ object PlaybackCenter {
                     }
                 }
             } finally {
-                setResolving(false)
+                // A cancelled older resolve must not clear a newer selection.
+                if (pendingVideo.complete(requestToken)) setResolving(false)
             }
         }
     }
@@ -1098,13 +1306,15 @@ object PlaybackCenter {
             return
         }
         sourceAppliedAt = SystemClock.elapsedRealtime()
+        videoFrameSeen = false
         player.run {
             setMediaSource(source, 0L)
             prepare()
-            playWhenReady = true
+            playWhenReady = if (videoRequestPending) pendingVideo.playWhenReady else true
             setPlaybackSpeed(speed)
         }
         startStartupWatchdog()
+        startFrameWatch()
     }
 
     /**
@@ -1130,11 +1340,16 @@ object PlaybackCenter {
                 val dt = (now - lastPollAt).coerceAtMost(1_000)
                 lastPollAt = now
                 val p = playerRef ?: break
+                if (!p.playWhenReady) {
+                    preparedAt = now
+                    stallSince = 0L
+                    continue
+                }
                 when (p.playbackState) {
                     Player.STATE_IDLE, Player.STATE_ENDED -> return@launch
                     Player.STATE_READY -> {
                         if (readyAt == 0L) readyAt = now
-                        if (p.isPlaying) {
+                        if (p.isPlaying && videoFrameSeen) {
                             stallSince = 0L
                             healthyMs += dt
                             // Connection proven: 15s of uninterrupted playback.
@@ -1208,18 +1423,21 @@ object PlaybackCenter {
         val entry = currentEntry ?: return
         val c = catalog ?: return
         val position = if (keepPosition) positionMs else 0L
-        val wasPlaying = playerRef?.isPlaying ?: true
+        val wasPlaying = playerRef?.playWhenReady ?: true
         val source = buildSource(entry, c) ?: return
         sourceAppliedAt = SystemClock.elapsedRealtime()
+        videoFrameSeen = false
         player.run {
             setMediaSource(source, position)
             prepare()
-            if (wasPlaying || !keepPosition) playWhenReady = true
+            playWhenReady = wasPlaying || !keepPosition
             setPlaybackSpeed(playbackSpeed)
         }
+        startFrameWatch()
     }
 
     private fun buildSource(entry: QueueEntry, c: StreamCatalog): MediaSource? {
+        retainedVideoSourceForAudio = false
         val metadata = MediaMetadata.Builder()
             .setTitle(entry.title)
             .setArtist(entry.uploader)
@@ -1279,9 +1497,7 @@ object PlaybackCenter {
         if (video != null) {
             return progressiveSource(MediaItem.Builder().setUri(audioUri(video)).setMediaMetadata(metadata).build())
         }
-        if (audio != null) {
-            return progressiveSource(MediaItem.Builder().setUri(audioUri(audio)).setMediaMetadata(metadata).build())
-        }
+        // Never silently play audio-only while the UI says Video.
         return null
     }
 
@@ -1293,6 +1509,8 @@ object PlaybackCenter {
     private fun applyVideoCap(capHeight: Int) {
         val p = playerRef ?: player
         val builder = p.trackSelectionParameters.buildUpon()
+            .setTrackTypeDisabled(C.TRACK_TYPE_VIDEO, false)
+            .setPreferredVideoMimeTypes("video/avc", "video/x-vnd.on2.vp9", "video/av01")
         if (capHeight > 0) builder.setMaxVideoSize(Int.MAX_VALUE, capHeight)
         else builder.clearVideoSizeConstraints()
         p.trackSelectionParameters = builder.build()
@@ -1544,20 +1762,172 @@ object PlaybackCenter {
     private class QueueForwardingPlayer(player: ExoPlayer) :
         ForwardingPlayer(player) {
 
+        private val listenerBridges = mutableMapOf<Player.Listener, Player.Listener>()
+        private var lastCommands: Player.Commands? = null
+        private var reportedPlayWhenReady = super.getPlayWhenReady()
+        private var reportedPlaybackState = super.getPlaybackState()
+        private var reportedIsPlaying = super.isPlaying()
+        private var reportedMetadata = super.getMediaMetadata()
+
+        // This is the logical queue player seen by the session. While extracting
+        // a new video's URL it is buffering, not still playing the old video.
+        override fun getPlayWhenReady(): Boolean =
+            if (videoRequestPending) pendingVideo.playWhenReady else super.getPlayWhenReady()
+
+        override fun getPlaybackState(): Int =
+            if (videoRequestPending) Player.STATE_BUFFERING else super.getPlaybackState()
+
+        override fun isPlaying(): Boolean = !videoRequestPending && super.isPlaying()
+
+        override fun getMediaMetadata(): MediaMetadata {
+            if (!videoRequestPending) return super.getMediaMetadata()
+            val entry = PlaybackCenter.currentEntry ?: return super.getMediaMetadata()
+            return MediaMetadata.Builder()
+                .setTitle(entry.title)
+                .setArtist(entry.uploader)
+                .setArtworkUri(entry.thumbnailUrl.takeIf { it.isNotBlank() }?.let(Uri::parse))
+                .build()
+        }
+
+        override fun setPlayWhenReady(playWhenReady: Boolean) {
+            if (videoRequestPending) {
+                pendingVideo.setPlayWhenReady(playWhenReady)
+                refreshSessionState()
+                PlaybackCenter.notify { it.onPlaybackStateChanged(false) }
+            } else {
+                super.setPlayWhenReady(playWhenReady)
+            }
+        }
+
+        override fun play() = setPlayWhenReady(true)
+        override fun pause() = setPlayWhenReady(false)
+
+        /** Emit actual logical-state changes synchronously; never poll or fake READY. */
+        fun refreshSessionState() {
+            refreshAvailableCommands()
+            val ready = playWhenReady
+            val state = playbackState
+            val playing = isPlaying
+            val metadata = mediaMetadata
+            val readyChanged = ready != reportedPlayWhenReady
+            val stateChanged = state != reportedPlaybackState
+            val playingChanged = playing != reportedIsPlaying
+            val metadataChanged = metadata != reportedMetadata
+            if (!readyChanged && !stateChanged && !playingChanged && !metadataChanged) return
+            reportedPlayWhenReady = ready
+            reportedPlaybackState = state
+            reportedIsPlaying = playing
+            reportedMetadata = metadata
+            val flags = androidx.media3.common.FlagSet.Builder()
+            if (readyChanged) flags.add(Player.EVENT_PLAY_WHEN_READY_CHANGED)
+            if (stateChanged) flags.add(Player.EVENT_PLAYBACK_STATE_CHANGED)
+            if (playingChanged) flags.add(Player.EVENT_IS_PLAYING_CHANGED)
+            if (metadataChanged) flags.add(Player.EVENT_MEDIA_METADATA_CHANGED)
+            val events = Player.Events(flags.build())
+            val snapshot = listenerBridges.keys.toList()
+            snapshot.forEach { listener ->
+                if (readyChanged) listener.onPlayWhenReadyChanged(ready, Player.PLAY_WHEN_READY_CHANGE_REASON_USER_REQUEST)
+                if (stateChanged) listener.onPlaybackStateChanged(state)
+                if (playingChanged) listener.onIsPlayingChanged(playing)
+                if (metadataChanged) listener.onMediaMetadataChanged(metadata)
+            }
+            snapshot.forEach { it.onEvents(this, events) }
+        }
+
+        override fun addListener(listener: Player.Listener) {
+            if (listenerBridges.containsKey(listener)) return
+            // Java-default callbacks require explicit forwarding, not Kotlin `by` delegation.
+            val bridge = object : PlayerListenerBridge(listener) {
+                override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+                    listener.onPlayWhenReadyChanged(this@QueueForwardingPlayer.playWhenReady, reason)
+                }
+
+                override fun onPlayerStateChanged(playWhenReady: Boolean, playbackState: Int) {
+                    listener.onPlayerStateChanged(this@QueueForwardingPlayer.playWhenReady, this@QueueForwardingPlayer.playbackState)
+                }
+
+                override fun onPlaybackStateChanged(playbackState: Int) {
+                    listener.onPlaybackStateChanged(this@QueueForwardingPlayer.playbackState)
+                }
+
+                override fun onIsPlayingChanged(isPlaying: Boolean) {
+                    listener.onIsPlayingChanged(this@QueueForwardingPlayer.isPlaying)
+                }
+
+                override fun onMediaMetadataChanged(mediaMetadata: MediaMetadata) {
+                    listener.onMediaMetadataChanged(this@QueueForwardingPlayer.mediaMetadata)
+                }
+
+                override fun onAvailableCommandsChanged(commands: Player.Commands) {
+                    val current = this@QueueForwardingPlayer.availableCommands
+                    lastCommands = current
+                    listener.onAvailableCommandsChanged(current)
+                }
+
+                override fun onEvents(player: Player, events: Player.Events) {
+                    refreshSessionState()
+                    listener.onEvents(this@QueueForwardingPlayer, events)
+                }
+            }
+            listenerBridges[listener] = bridge
+            super.addListener(bridge)
+        }
+
+        override fun removeListener(listener: Player.Listener) {
+            val bridge = listenerBridges.remove(listener) ?: return
+            super.removeListener(bridge)
+        }
+
         private fun queueHasNext(): Boolean = when (PlaybackCenter.mode) {
-            Mode.VIDEO, Mode.AUDIO ->
-                PlaybackCenter.queueIndex < PlaybackCenter.queue.size - 1
+            Mode.VIDEO -> QueueNavigationPolicy.hasNext(PlaybackCenter.queueIndex, PlaybackCenter.queue.size)
+            Mode.AUDIO -> super.hasNextMediaItem()
+            Mode.NONE -> false
+        }
+
+        private fun queueHasPrevious(): Boolean = when (PlaybackCenter.mode) {
+            Mode.VIDEO -> QueueNavigationPolicy.hasPrevious(PlaybackCenter.queueIndex, PlaybackCenter.queue.size)
+            Mode.AUDIO -> super.hasPreviousMediaItem()
             Mode.NONE -> false
         }
 
         override fun isCommandAvailable(command: Int): Boolean = when (command) {
-            Player.COMMAND_SEEK_TO_NEXT, Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM ->
-                queueHasNext() || super.isCommandAvailable(command)
+            Player.COMMAND_SEEK_TO_NEXT, Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM -> queueHasNext()
+            Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM -> queueHasPrevious()
+            Player.COMMAND_SEEK_TO_PREVIOUS -> when (PlaybackCenter.mode) {
+                Mode.VIDEO -> QueueNavigationPolicy.hasCurrent(PlaybackCenter.queueIndex, PlaybackCenter.queue.size)
+                Mode.AUDIO -> super.isCommandAvailable(command)
+                Mode.NONE -> false
+            }
             else -> super.isCommandAvailable(command)
         }
 
+        override fun getAvailableCommands(): Player.Commands {
+            val commands = super.getAvailableCommands().buildUpon()
+            for (command in listOf(
+                Player.COMMAND_SEEK_TO_NEXT, Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM,
+                Player.COMMAND_SEEK_TO_PREVIOUS, Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM
+            )) {
+                if (isCommandAvailable(command)) commands.add(command) else commands.remove(command)
+            }
+            return commands.build()
+        }
+
+        fun refreshAvailableCommands() {
+            val current = availableCommands
+            if (current == lastCommands) return
+            lastCommands = current
+            val snapshot = listenerBridges.keys.toList()
+            snapshot.forEach { it.onAvailableCommandsChanged(current) }
+            val events = Player.Events(androidx.media3.common.FlagSet.Builder()
+                .add(Player.EVENT_AVAILABLE_COMMANDS_CHANGED).build())
+            snapshot.forEach { it.onEvents(this, events) }
+        }
+
         override fun hasNextMediaItem(): Boolean =
-            queueHasNext() || super.hasNextMediaItem()
+            queueHasNext()
+
+        override fun hasPreviousMediaItem(): Boolean =
+            queueHasPrevious()
 
         override fun seekToNext() {
             PlaybackCenter.next()
@@ -1579,29 +1949,93 @@ object PlaybackCenter {
     /** The wrapper for the currently attached PlayerView + the raw player it wraps. */
     private var forwardingPlayer: QueueForwardingPlayer? = null
     private var forwardingFor: ExoPlayer? = null
+    /** ExoPlayer has one video output; only this view may own it at a time. */
+    private var activePlayerView: PlayerView? = null
 
     @OptIn(UnstableApi::class)
     fun attachView(view: PlayerView) {
-        val raw = playerRef ?: return
-        val fwd = forwardingPlayer?.takeIf { forwardingFor === raw }
-            ?: QueueForwardingPlayer(raw).also {
-                forwardingPlayer = it
-                forwardingFor = raw
-            }
-        view.player = fwd
+        val outputPlayer = player
+        if (activePlayerView === view && view.player === outputPlayer) return
+        // Rendering does not need queue-command interception/listener bridging.
+        // Queue-aware notification controls continue to use sessionPlayer.
+        videoFrameSeen = false
+        PlayerView.switchTargetView(outputPlayer, activePlayerView, view)
+        activePlayerView = view
+        android.util.Log.i("SparkTubeVideo", "attach ${view.javaClass.simpleName} output=${view.videoSurfaceView?.javaClass?.simpleName}")
+        startFrameWatch()
     }
 
     fun detachView(view: PlayerView) {
-        if (view.player === forwardingPlayer) {
-            view.player = null
+        if (activePlayerView !== view) return
+        activePlayerView = null
+        if (view.player === playerRef) view.player = null
+        frameWatchJob?.cancel()
+    }
+
+    /** READY/isPlaying can be audio-only. Measure actual first-frame delivery on a visible output. */
+    private fun startFrameWatch() {
+        frameWatchJob?.cancel()
+        if (mode != Mode.VIDEO || audioOnlyMode || videoFrameSeen) return
+        frameWatchJob = scope.launch {
+            var visibleWaitMs = 0L
+            var last = SystemClock.elapsedRealtime()
+            while (isActive) {
+                delay(500)
+                val now = SystemClock.elapsedRealtime()
+                val elapsed = (now - last).coerceAtMost(1_000L)
+                last = now
+                val p = playerRef ?: return@launch
+                val view = activePlayerView
+                if (videoFrameSeen || mode != Mode.VIDEO || audioOnlyMode) return@launch
+                // No recovery while backgrounded, hidden, paused, or waiting for network startup.
+                if (view == null || !view.isShown || !view.isAttachedToWindow ||
+                    view.windowVisibility != android.view.View.VISIBLE ||
+                    !p.playWhenReady || p.playbackState != Player.STATE_READY) continue
+                visibleWaitMs += elapsed
+                when (VideoFramePolicy.action(visibleWaitMs, videoFrameSeen, frameRecoveryStep)) {
+                    VideoFramePolicy.Action.WAIT -> Unit
+                    VideoFramePolicy.Action.REBIND_OUTPUT -> {
+                        frameRecoveryStep++
+                        visibleWaitMs = 0L
+                        android.util.Log.w("SparkTubeVideo", "No first frame: rebinding output; videoSelected=${p.currentTracks.isTypeSelected(C.TRACK_TYPE_VIDEO)} size=${p.videoSize.width}x${p.videoSize.height}")
+                        // A view reference alone doesn't prove a live renderer output.
+                        view.player = null
+                        view.player = p
+                    }
+                    VideoFramePolicy.Action.RETRY_SOURCE -> {
+                        frameRecoveryStep++
+                        val c = catalog
+                        if (c != null) {
+                            android.util.Log.w("SparkTubeVideo", "No first frame after rebind: retrying progressive source")
+                            dashBlocked = true
+                            usedFallback = c.muxed.isNotEmpty()
+                            rebuildSource(keepPosition = true)
+                            return@launch
+                        }
+                        visibleWaitMs = 0L
+                    }
+                    VideoFramePolicy.Action.SHOW_ERROR -> {
+                        android.util.Log.e("SparkTubeVideo", "Video output failed after bounded recovery")
+                        p.pause()
+                        notify { it.onError("Video could not render on this device. Tap Retry or choose a different quality.") }
+                        return@launch
+                    }
+                }
+            }
         }
     }
 
     fun release() {
+        clearSleepTimer()
+        frameWatchJob?.cancel()
         resolveJob?.cancel()
         prefetchJob?.cancel()
         watchdogJob?.cancel()
         scope.cancel()
+        activePlayerView?.let { view ->
+            if (view.player === playerRef) view.player = null
+        }
+        activePlayerView = null
         forwardingPlayer = null
         forwardingFor = null
         playerRef?.release()

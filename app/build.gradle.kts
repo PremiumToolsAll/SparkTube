@@ -15,8 +15,8 @@ android {
         applicationId = "com.sparktube.app"
         minSdk = 24
         targetSdk = 34
-        versionCode = 10
-        versionName = "1.4.1"
+        versionCode = 11
+        versionName = "1.4.2"
     }
 
     // Release signing: credentials come from environment variables so they
@@ -51,6 +51,20 @@ android {
                 signingConfig = signingConfigs.getByName("release")
             }
         }
+        // Compact test APK: use D8's non-debug dex packaging, but keep every
+        // class/resource and the existing test-build behavior. No R8 shrinking,
+        // obfuscation, language filtering, ABI filtering or feature removal.
+        create("compactTest") {
+            initWith(getByName("debug"))
+            isDebuggable = false
+            isMinifyEnabled = false
+            isShrinkResources = false
+            signingConfig = signingConfigs.getByName("debug")
+            matchingFallbacks += listOf("debug")
+            // Keep the debug test's update-check/crash-report behavior even
+            // though this compact APK does not allow debugger attachment.
+            buildConfigField("boolean", "DEBUG", "true")
+        }
     }
 
     compileOptions {
@@ -80,6 +94,7 @@ kotlin {
 dependencies {
     val media3Version = "1.3.1"
 
+    testImplementation(files("libs/test/junit-4.13.2.jar", "libs/test/hamcrest-core-1.3.jar"))
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("com.google.android.material:material:1.12.0")

@@ -99,6 +99,19 @@ class MainActivity : AppCompatActivity() {
         }
 
         applySelection()
+        if (intent.getBooleanExtra(EXTRA_OPEN_DOWNLOADS, false)) showDownloads()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (intent.getBooleanExtra(EXTRA_OPEN_DOWNLOADS, false)) showDownloads()
+    }
+
+    private fun showDownloads() {
+        select(R.id.navLibrary)
+        supportFragmentManager.executePendingTransactions()
+        (fragments[R.id.navLibrary] as? LibraryFragment)?.showDownloadsTab()
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -278,6 +291,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     companion object {
+        private const val EXTRA_OPEN_DOWNLOADS = "open_downloads"
+        fun openDownloads(context: android.content.Context) {
+            context.startActivity(Intent(context, MainActivity::class.java).apply {
+                putExtra(EXTRA_OPEN_DOWNLOADS, true)
+                addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            })
+        }
         private const val STATE_SELECTED = "selected_nav"
         private const val REQ_NOTIFICATIONS = 4711
         private val NAV_IDS = intArrayOf(R.id.navHome, R.id.navMusic, R.id.navLibrary, R.id.navMenu)

@@ -13,7 +13,10 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -50,6 +53,7 @@ object DownloadCenter {
 
     const val STATUS_PENDING = "PENDING"
     const val STATUS_RUNNING = "RUNNING"
+    const val STATUS_PAUSED = "PAUSED"
     const val STATUS_DONE = "DONE"
     const val STATUS_FAILED = "FAILED"
 
@@ -85,7 +89,7 @@ object DownloadCenter {
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    private val jobIdSeq = AtomicLong(1L)
+    private val jobIdSeq = AtomicLong(System.currentTimeMillis())
 
     /** Live jobs by internal job id — the replacement for DownloadManager ids. */
     private val jobs = ConcurrentHashMap<Long, DownloadJob>()
@@ -104,7 +108,7 @@ object DownloadCenter {
 
     fun hasActiveDownload(context: Context, videoUrl: String): Boolean =
         recordsFor(context, videoUrl).any {
-            it.status == STATUS_PENDING || it.status == STATUS_RUNNING
+            it.status == STATUS_PENDING || it.status == STATUS_RUNNING || it.status == STATUS_PAUSED
         }
 
     /**
@@ -113,21 +117,32 @@ object DownloadCenter {
      */
     fun downloadProgress(context: Context, videoUrl: String): Int {
         val active = recordsFor(context, videoUrl)
-            .filter { it.status == STATUS_PENDING || it.status == STATUS_RUNNING }
+            .filter { it.status == STATUS_PENDING || it.status == STATUS_RUNNING || it.status == STATUS_PAUSED }
         if (active.isEmpty()) return -1
-        var done = 0L
-        var total = 0L
-        active.forEach { record ->
-            record.downloadIds.forEach { id ->
-                val job = jobs[id]
-                if (job != null) {
-                    done += job.progress.get()
-                    total += job.size
-                }
-            }
+        val snapshots = active.map(::metrics)
+        return calculateDownloadMetrics(
+            snapshots.sumOf { it.downloadedBytes }, snapshots.map { it.totalBytes }, 0.0
+        ).progressPercent
+    }
+
+    /** Progress for the live jobs belonging to one record, or zero if unknown. */
+    fun progressPercent(record: DownloadRecord): Int {
+        return metrics(record).progressPercent
+    }
+
+    /** Aggregate byte/rate/ETA metrics for a record, including paired AV jobs. */
+    fun metrics(record: DownloadRecord): DownloadMetrics {
+        val live = record.downloadIds.mapNotNull { jobs[it] }
+        if (live.isEmpty()) {
+            val lengths = record.filePaths.map { path -> File(path).takeIf { it.isFile }?.length() }
+            val downloaded = lengths.filterNotNull().sum()
+            val total = if (lengths.isNotEmpty() && lengths.all { it != null }) lengths.filterNotNull().sum() else null
+            return calculateDownloadMetrics(downloaded, listOf(total), 0.0)
         }
-        if (total <= 0L) return 0
-        return ((done * 100) / total).toInt().coerceIn(0, 100)
+        val downloaded = live.sumOf { it.progress.get() }
+        val totals = record.downloadIds.map { id -> jobs[id]?.size?.takeIf { size -> size > 0L } }
+        val rate = live.filterNot { it.finished.get() || it.paused.get() }.sumOf { it.bytesPerSecond() }
+        return calculateDownloadMetrics(downloaded, totals, rate)
     }
 
     /** Deletes every download (files + registry). */
@@ -233,6 +248,24 @@ object DownloadCenter {
         audioJob.start()
     }
 
+    /** Pause/resume live transfers; partial files and byte counters are kept in memory/on disk. */
+    fun togglePause(context: Context, record: DownloadRecord) = synchronized(syncLock) {
+        val active = record.downloadIds.mapNotNull { jobs[it] }
+        if (active.isEmpty() || active.all { it.finished.get() } || active.any { it.failed.get() }) {
+            syncLocked(context)
+            return@synchronized
+        }
+        val pause = !active.filterNot { it.finished.get() }.all { it.paused.get() }
+        active.forEach {
+            it.resetSpeedSample()
+            it.paused.set(pause)
+        }
+        LocalStore.updateDownloadStatus(context, record.downloadIds.first(), if (pause) STATUS_PAUSED else STATUS_RUNNING)
+    }
+
+    /** Legacy compatibility: decimal megabits/sec as before. */
+    fun speedMbps(record: DownloadRecord): Double = metrics(record).bytesPerSecond * 8.0 / 1_000_000.0
+
     /** Deletes the files of a record and removes it from the registry. */
     fun delete(context: Context, record: DownloadRecord) = synchronized(syncLock) {
         record.downloadIds.forEach { id ->
@@ -283,13 +316,17 @@ object DownloadCenter {
                     recordJobs.isEmpty() -> STATUS_FAILED
                     recordJobs.any { it.failed.get() } -> STATUS_FAILED
                     recordJobs.all { it.finished.get() } -> STATUS_DONE
+                    recordJobs.filterNot { it.finished.get() }.all { it.paused.get() } -> STATUS_PAUSED
                     else -> STATUS_RUNNING
                 }
                 if (newStatus != record.status) {
                     LocalStore.updateDownloadStatus(context, record.downloadIds.first(), newStatus)
                     if (newStatus == STATUS_DONE || newStatus == STATUS_FAILED) {
                         // Terminal state: now the live jobs can go.
-                        recordJobs.forEach { jobs.remove(it.id) }
+                        recordJobs.forEach {
+                            jobs.remove(it.id)
+                            if (newStatus == STATUS_FAILED) it.cancel()
+                        }
                         if (newStatus == STATUS_DONE) {
                             announceDone(context)
                         }
@@ -323,6 +360,20 @@ object DownloadCenter {
 
         private var job: Job? = null
         private val cancelled = AtomicBoolean(false)
+        val paused = AtomicBoolean(false)
+        private val speedSampler = DownloadSpeedSampler()
+        fun bytesPerSecond(): Double = speedSampler.bytesPerSecond(System.nanoTime())
+        fun resetSpeedSample() {
+            speedSampler.reset(System.nanoTime(), progress.get())
+        }
+        private suspend fun awaitActive() {
+            while (paused.get() && !cancelled.get()) kotlinx.coroutines.delay(100)
+            kotlinx.coroutines.currentCoroutineContext().ensureActive()
+        }
+        private fun countBytes(n: Int) {
+            val cumulative = progress.addAndGet(n.toLong())
+            speedSampler.onBytes(cumulative, System.nanoTime())
+        }
 
         fun start() {
             file.parentFile?.mkdirs()
@@ -333,6 +384,9 @@ object DownloadCenter {
                     .onFailure { Log.w(TAG, "Download job #$id failed for $url", it) }
                     .getOrElse { false }
                 if (ok && !cancelled.get()) {
+                    // An unknown-length component now has an exact final size;
+                    // keep it in a paired record's aggregate while its peer runs.
+                    if (size <= 0L) size = progress.get()
                     finished.set(true)
                 } else {
                     failed.set(true)
@@ -367,9 +421,10 @@ object DownloadCenter {
                 totalSize = contentRange
                     ?.substringAfterLast('/')
                     ?.toLongOrNull()
-                    ?: -1L
-                rangesSupported = (contentRange != null) ||
-                    (acceptRanges?.equals("bytes", ignoreCase = true) == true)
+                    ?: if (resp.code == 200) resp.body?.contentLength()?.takeIf { it > 0L } ?: -1L else -1L
+                // Accept-Ranges is only an advertisement; a 200 response to
+                // our Range probe means ranges were not actually honored.
+                rangesSupported = resp.code == 206 && contentRange != null
             }
 
             if (totalSize <= 0L) {
@@ -379,7 +434,11 @@ object DownloadCenter {
             }
 
             size = totalSize
-            if (!rangesSupported || totalSize < MIN_SIZE_FOR_SPLIT) {
+            if (!rangesSupported) {
+                size = totalSize
+                return@withContext plainDownload()
+            }
+            if (totalSize < MIN_SIZE_FOR_SPLIT) {
                 return@withContext segmentedDownload(0L, totalSize - 1L)
             }
 
@@ -393,14 +452,13 @@ object DownloadCenter {
             RandomAccessFile(file, "rw").use { raf ->
                 raf.setLength(totalSize)
             }
-            val results = bounds.map { (start, end) ->
-                launchSegment(start, end)
+            return@withContext coroutineScope {
+                val results = bounds.map { (start, end) -> launchSegment(start, end) }
+                results.map { segJob ->
+                    segJob.job.join()
+                    segJob.completed.get()
+                }.all { it }
             }
-            // Join every segment in order; collect their success flags.
-            results.map { segJob ->
-                segJob.job.join()
-                segJob.completed.get()
-            }.all { it }
         }
 
         private fun newRequest(): Request.Builder =
@@ -418,21 +476,27 @@ object DownloadCenter {
                         return@withContext false
                     }
                     val body = resp.body ?: return@withContext false
+                    // Full GET length can be known even when the probe omitted
+                    // Content-Range. Never use a one-byte 206 probe's length.
+                    size = body.contentLength().takeIf { it > 0L } ?: 0L
                     file.outputStream().use { out ->
                         body.byteStream().use { input ->
                             val buf = ByteArray(64 * 1024)
                             while (true) {
                                 if (cancelled.get()) return@withContext false
+                                awaitActive()
                                 val read = input.read(buf)
                                 if (read < 0) break
                                 out.write(buf, 0, read)
-                                progress.addAndGet(read.toLong())
+                                countBytes(read)
                             }
                             out.flush()
                         }
                     }
                 }
                 true
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Log.w(TAG, "Plain download error for $url", e)
                 false
@@ -440,41 +504,52 @@ object DownloadCenter {
         }
 
         /** One contiguous byte range, written at its offset. Retries a few times. */
-        private fun launchSegment(start: Long, end: Long): SegmentJob {
+        private fun kotlinx.coroutines.CoroutineScope.launchSegment(start: Long, end: Long): SegmentJob {
             val completedFlag = AtomicBoolean(false)
-            val segJob = DownloadCenter.scope.launch(Dispatchers.IO) {
+            val segJob = launch(Dispatchers.IO) {
                 var attempt = 0
+                var written = 0L
                 while (attempt <= CHUNK_RETRIES && !cancelled.get()) {
                     try {
+                        awaitActive()
+                        currentCoroutineContext().ensureActive()
                         val request = newRequest()
-                            .header("Range", "bytes=$start-$end")
+                            .header("Range", "bytes=${start + written}-$end")
                             .build()
                         DownloadCenter.client.newCall(request).execute().use { resp ->
-                            if (!resp.isSuccessful) throw IOException("HTTP ${resp.code}")
+                            val range = resp.header("Content-Range")
+                            val match = range?.let { Regex("bytes (\\d+)-(\\d+)/(\\d+|\\*)").matchEntire(it) }
+                            if (resp.code != 206 || match == null ||
+                                match.groupValues[1].toLongOrNull() != start + written ||
+                                match.groupValues[2].toLongOrNull() != end ||
+                                (match.groupValues[3] != "*" && match.groupValues[3].toLongOrNull() != size)) {
+                                throw IOException("Invalid range response HTTP ${resp.code}: $range")
+                            }
                             val body = resp.body ?: throw IOException("Empty body")
                             RandomAccessFile(file, "rw").use { raf ->
-                                raf.seek(start)
+                                raf.seek(start + written)
                                 val input = body.byteStream()
                                 val buf = ByteArray(64 * 1024)
-                                var written = 0L
-                                val expected = end - start + 1
+                                val expected = end - start + 1L
                                 while (written < expected) {
-                                    if (cancelled.get()) return@launch
+                                    if (cancelled.get()) throw kotlinx.coroutines.CancellationException("Download cancelled")
+                                    awaitActive()
                                     val read = input.read(buf, 0, minOf(buf.size.toLong(), expected - written).toInt())
                                     if (read < 0) throw IOException("Unexpected end of stream")
                                     raf.write(buf, 0, read)
                                     written += read.toLong()
-                                    progress.addAndGet(read.toLong())
+                                    countBytes(read)
                                 }
                             }
                             completedFlag.set(true)
                             return@launch
                         }
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        throw e
                     } catch (e: Exception) {
                         attempt++
                         if (attempt > CHUNK_RETRIES) break
-                        // Exponential-ish backoff between retries.
-                        try { Thread.sleep(300L * attempt) } catch (_: InterruptedException) {}
+                        kotlinx.coroutines.delay(300L * attempt)
                     }
                 }
             }
@@ -484,9 +559,11 @@ object DownloadCenter {
         /** Single-range convenience wrapper (small files). */
         private suspend fun segmentedDownload(start: Long, end: Long): Boolean {
             RandomAccessFile(file, "rw").use { raf -> raf.setLength(end + 1) }
-            val seg = launchSegment(start, end)
-            seg.job.join()
-            return seg.completed.get()
+            return coroutineScope {
+                val seg = launchSegment(start, end)
+                seg.job.join()
+                seg.completed.get()
+            }
         }
     }
 

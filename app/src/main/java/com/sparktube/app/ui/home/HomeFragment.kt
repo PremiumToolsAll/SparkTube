@@ -10,7 +10,6 @@ import androidx.core.view.isVisible
 import androidx.fragment.app.Fragment
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
-import com.sparktube.app.BuildConfig
 import com.sparktube.app.R
 import com.sparktube.app.data.Countries
 import com.sparktube.app.data.RecommendEngine
@@ -39,6 +38,8 @@ class HomeFragment : Fragment() {
     private lateinit var adapter: VideoAdapter
     private var loadedCountry: String? = null
     private var loadJob: kotlinx.coroutines.Job? = null
+    @Volatile private var feedGeneration = 0L
+    private var visibleCountry: String? = null
 
     /**
      * Elapsed-realtime stamp of the last successful feed load. The feed now
@@ -73,23 +74,6 @@ class HomeFragment : Fragment() {
         binding.searchButton.setOnClickListener {
             startActivity(
                 SearchActivity.intent(requireContext(), music = false)
-            )
-        }
-
-        // Test-crash button: verifies the local crash reporter pipeline
-        // (CrashReporter writes reports into the "SparkTube" folder on the
-        // device — Download/SparkTube on Android 10+).
-        // DEBUG BUILDS ONLY — release users never see it.
-        // Tap → uncaught exception → report file written to the device →
-        // reopen the app and check Settings → Crash logs to view/share it.
-        binding.crashTestButton.isVisible = BuildConfig.DEBUG
-        binding.crashTestButton.setOnClickListener {
-            CrashReporter.logBreadcrumb("Test crash button tapped on Home")
-            CrashReporter.logBreadcrumb(
-                "loaded_country=${loadedCountry ?: "<not loaded>"}"
-            )
-            throw RuntimeException(
-                "SparkTube test crash — local crash report check"
             )
         }
 
@@ -141,8 +125,7 @@ class HomeFragment : Fragment() {
     private fun load() {
         val country = AppPrefs.countryOrDefault
         loadedCountry = country
-        lastLoadedAt = SystemClock.elapsedRealtime()
-
+        val generation = ++feedGeneration
         loadJob?.cancel()
         // Capture the binding: a theme change relaunches the activity, which
         // destroys this view (nulling _binding) while the coroutine may still
@@ -154,18 +137,55 @@ class HomeFragment : Fragment() {
         loadJob = viewLifecycleOwner.lifecycleScope.launch {
             b.errorView.isVisible = false
             b.emptyView.isVisible = false
-            // Skeleton cards instead of a spinner: the feed keeps its shape
-            // while the personalized list is being fetched.
-            showSkeleton(b.list, SkeletonAdapter.STYLE_VIDEO, count = 10)
+            b.list.adapter = adapter
+            if (visibleCountry != null && visibleCountry != country) {
+                adapter.submitList(emptyList())
+                visibleCountry = null
+            }
+            b.swipe.isRefreshing = visibleCountry == country && adapter.currentList.isNotEmpty()
             try {
+                // Disk access is off-main. A cached list is installed before any network work.
+                val cached = withContext(Dispatchers.IO) { HomeFeedCache.read(ctx, country) }
+                if (!isCurrent(b, country, generation)) return@launch
+                if (cached.isNotEmpty()) {
+                    adapter.submitList(cached)
+                    visibleCountry = country
+                } else if (visibleCountry != country || adapter.currentList.isEmpty()) {
+                    showSkeleton(b.list, SkeletonAdapter.STYLE_VIDEO, count = 10)
+                }
                 val snap = withContext(Dispatchers.IO) {
                     RecommendEngine.snapshot(ctx)
                 }
-                val items = YtRepository.personalizedFeed(country, snap)
+                val items = YtRepository.personalizedFeed(country, snap, onInitialItems = { initial ->
+                    val preview = initial.map { it.toUiModel() }
+                    withContext(Dispatchers.Main) {
+                        if (preview.isNotEmpty() && (visibleCountry != country || adapter.currentList.isEmpty()) && isCurrent(b, country, generation)) {
+                            b.list.adapter = adapter
+                            adapter.submitList(preview)
+                            visibleCountry = country
+                        }
+                    }
+                })
+                if (!isCurrent(b, country, generation)) return@launch
+                val models = items.map { it.toUiModel() }
                 b.list.adapter = adapter
-                adapter.submitList(items.map { it.toUiModel() })
-                b.emptyView.isVisible = items.isEmpty()
-                if (items.isEmpty()) {
+                if (models.isNotEmpty()) {
+                    adapter.submitList(models)
+                    visibleCountry = country
+                    lastLoadedAt = SystemClock.elapsedRealtime()
+                    withContext(Dispatchers.IO) {
+                        if (isActive && generation == feedGeneration && AppPrefs.countryOrDefault == country) {
+                            HomeFeedCache.write(ctx, country, models, shouldWrite = {
+                                generation == feedGeneration && AppPrefs.countryOrDefault == country
+                            })
+                        }
+                    }
+                } else if (adapter.currentList.isNotEmpty()) {
+                    // An empty network result must not erase a useful saved feed.
+                    b.emptyView.isVisible = false
+                }
+                b.emptyView.isVisible = items.isEmpty() && adapter.currentList.isEmpty()
+                if (items.isEmpty() && adapter.currentList.isEmpty()) {
                     b.errorText.text = getString(R.string.error_no_results)
                     b.errorView.isVisible = true
                 }
@@ -173,20 +193,30 @@ class HomeFragment : Fragment() {
                 // A newer load() cancelled this one: not an error.
                 throw e
             } catch (e: Exception) {
+                if (!isCurrent(b, country, generation)) return@launch
                 b.list.adapter = adapter
-                adapter.submitList(emptyList())
-                b.errorText.text = Formatters.friendlyException(e)
-                b.errorView.isVisible = true
+                if (adapter.currentList.isEmpty()) {
+                    b.errorText.text = Formatters.friendlyException(e)
+                    b.errorView.isVisible = true
+                }
                 // Mark as "never loaded" so the next return to this screen
                 // retries automatically instead of waiting out the 5 min.
                 lastLoadedAt = 0L
             } finally {
-                b.swipe.isRefreshing = false
+                if (_binding === b && generation == feedGeneration) b.swipe.isRefreshing = false
             }
         }
     }
 
+    private fun isCurrent(b: FragmentHomeBinding, country: String, generation: Long): Boolean =
+        _binding === b && isAdded && generation == feedGeneration && AppPrefs.countryOrDefault == country
+
     override fun onDestroyView() {
+        feedGeneration++
+        loadJob?.cancel()
+        loadedCountry = null
+        visibleCountry = null
+        lastLoadedAt = 0L
         super.onDestroyView()
         _binding = null
     }

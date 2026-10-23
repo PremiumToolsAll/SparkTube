@@ -14,6 +14,10 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.view.isVisible
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.CancellationException
+import com.sparktube.app.ui.player.PlayerActivity
 import coil.load
 import com.sparktube.app.R
 import com.sparktube.app.data.LocalStore
@@ -55,11 +59,14 @@ class NowPlayingActivity : AppCompatActivity() {
 
         // Radio keeps adding songs while it plays: keep "Up next" current.
         override fun onQueueChanged() = bindUpNext()
+        override fun onSleepTimerChanged() = bindTimer()
+        override fun onSleepTimerExpired() { finish() }
     }
 
     private val progressRunnable = object : Runnable {
         override fun run() {
             updateProgress()
+            bindTimer()
             updateDownloadState()
             handler.postDelayed(this, 500)
         }
@@ -83,6 +90,23 @@ class NowPlayingActivity : AppCompatActivity() {
         requestNotificationPermissionIfNeeded()
 
         binding.backButton.setOnClickListener { finish() }
+        binding.modeSwitch.setOnClickListener {
+            binding.modeSwitch.isEnabled = false
+            lifecycleScope.launch {
+                try {
+                    val available = if (PlaybackCenter.mode == PlaybackCenter.Mode.VIDEO) {
+                        PlaybackCenter.switchBackToVideo()
+                        true
+                    } else PlaybackCenter.switchMusicToVideo()
+                    if (available) {
+                        PlayerActivity.startResume(this@NowPlayingActivity)
+                        finish()
+                    } else Toast.makeText(this@NowPlayingActivity, R.string.switch_video_unavailable, Toast.LENGTH_SHORT).show()
+                } catch (e: CancellationException) { throw e }
+                catch (e: Exception) { Toast.makeText(this@NowPlayingActivity, e.message ?: getString(R.string.switch_video_unavailable), Toast.LENGTH_SHORT).show() }
+                finally { binding.modeSwitch.isEnabled = true }
+            }
+        }
         binding.playPauseButton.setOnClickListener { PlaybackCenter.togglePlayPause() }
         binding.prevButton.setOnClickListener { PlaybackCenter.previous() }
         binding.nextButton.setOnClickListener { PlaybackCenter.next() }
@@ -97,6 +121,7 @@ class NowPlayingActivity : AppCompatActivity() {
         binding.radioButton.setOnClickListener { restartRadio() }
         binding.downloadButton.setOnClickListener { onDownloadClicked() }
         binding.queueButton.setOnClickListener { showQueue() }
+        binding.timerButton.setOnClickListener { SleepTimerSheet(this).show() }
         binding.upNextCard.setOnClickListener { showQueue() }
 
         // The artwork is always a square that fits the space the controls
@@ -257,6 +282,11 @@ class NowPlayingActivity : AppCompatActivity() {
             binding.upNextLabel.setText(R.string.up_next_radio_label)
             binding.upNextTitle.setText(R.string.queue_loading)
         }
+    }
+
+    private fun bindTimer() {
+        binding.timerButton.text = SleepTimerSheet.buttonLabel(this)
+        binding.timerButton.contentDescription = SleepTimerSheet.accessibilityLabel(this)
     }
 
     private fun showQueue() {

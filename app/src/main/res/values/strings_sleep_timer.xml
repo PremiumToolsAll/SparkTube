@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="sleep_timer_button">Timer</string>
+    <string name="sleep_timer_title">Sleep timer</string>
+    <string name="sleep_timer_off">Off</string>
+    <string name="sleep_timer_minutes">%1$d minutes</string>
+    <string name="sleep_timer_hour">1 hour</string>
+    <string name="sleep_timer_end">End of video</string>
+    <string name="sleep_timer_end_countdown">End · %1$s</string>
+    <string name="sleep_timer_accessibility">Sleep timer: %1$s</string>
+    <string name="sleep_timer_selected">%1$s, selected</string>
+</resources>

@@ -305,4 +305,8 @@
     <string name="playing_from_queue">Playing from your queue</string>
     <string name="music_play_all">Play all</string>
     <string name="music_songs_fmt">%1$d songs</string>
+    <string name="video_options">Video options</string>
+    <string name="video_more_options">More options for %1$s</string>
+    <string name="video_remove_from_list">Remove from this list</string>
+    <string name="video_remove_favorite">Remove from favorites</string>
 </resources>

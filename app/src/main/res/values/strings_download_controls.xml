@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="download_pause">Pause</string>
+    <string name="download_resume">Resume</string>
+    <string name="download_share">Share</string>
+    <string name="download_speed">%1$.2f MB/s</string>
+    <string name="download_paused">Paused</string>
+    <string name="download_progress_speed">%1$d%% · %2$.2f MB/s</string>
+    <string name="download_progress_paused">%1$d%% · Paused</string>
+    <string name="download_options">Download options</string>
+    <string name="download_open">Play</string>
+    <string name="download_delete">Delete</string>
+    <string name="download_total_unknown">size unknown</string>
+    <string name="download_size_progress">%1$s / %2$s</string>
+    <string name="download_remaining">~%1$s left</string>
+    <string name="download_time_unknown">Time unknown</string>
+    <string name="download_estimating">Estimating time</string>
+    <string name="download_waiting">Waiting for data</string>
+    <string name="download_file_missing">Downloaded file is missing.</string>
+    <string name="download_share_unavailable">No app could open this share. Check the downloaded files.</string>
+    <string name="download_process_limit">In-progress downloads pause only for this app process; if the process is stopped, the partial transfer cannot resume and will need to be downloaded again.</string>
+</resources>

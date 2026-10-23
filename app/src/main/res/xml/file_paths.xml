@@ -13,4 +13,7 @@
     <files-path
         name="crash_logs_internal"
         path="SparkTube/" />
+    <external-files-path name="download_movies" path="Movies/SparkTube/" />
+    <external-files-path name="download_music" path="Music/SparkTube/" />
+    <files-path name="internal_downloads" path="SparkTube/" />
 </paths>

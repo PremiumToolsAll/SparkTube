@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.res.Configuration
+import android.media.AudioManager
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
@@ -31,6 +32,7 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.core.view.doOnPreDraw
 import androidx.core.view.isVisible
 import androidx.core.view.updateLayoutParams
+import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
@@ -83,6 +85,16 @@ class PlayerActivity : AppCompatActivity() {
 
     private var swipeTriggered = false
     private lateinit var gestureDetector: GestureDetector
+    private var gestureTracking = false
+    private var gestureStartedInLandscape = false
+    private var portraitGestureRejected = false
+    private var gestureStartVolume = 0
+    private var gestureStartBrightness = 0.5f
+    private var gestureAxis = PlayerGestureMath.Axis.NONE
+    private var gestureStartPosition = 0L
+    private var pendingSeekTarget: Long? = null
+    private val hideGestureFeedback = Runnable { binding.gestureFeedback.isVisible = false }
+    private var retiringPip = false
 
     /** Mirrors the built-in controller's visibility (gear / seek controls). */
     private var controllerVisible = false
@@ -98,21 +110,39 @@ class PlayerActivity : AppCompatActivity() {
 
     private val playbackListener = object : PlaybackCenter.Listener {
         override fun onItemChanged(entry: QueueEntry?) {
+            updateQueueControls()
             if (entry != null && entry.url != loadedUrl) {
                 loadedUrl = entry.url
                 bind(entry)
             }
         }
 
+        override fun onQueueChanged() = updateQueueControls()
+        override fun onSleepTimerExpired() { finish() }
+        override fun onSleepTimerChanged() {
+            binding.actionTimerLabel.text = com.sparktube.app.ui.music.SleepTimerSheet.buttonLabel(this@PlayerActivity)
+            binding.actionTimer.contentDescription = com.sparktube.app.ui.music.SleepTimerSheet.accessibilityLabel(this@PlayerActivity)
+        }
+
+        override fun onPlaybackStateChanged(isPlaying: Boolean) = updateQueueControls()
+
+        override fun onVideoFrameRendered() {
+            binding.errorView.isVisible = false
+            binding.loading.isVisible = false
+        }
+
         override fun onResolvingChanged(isResolving: Boolean) {
+            updateQueueControls()
             binding.loading.isVisible = isResolving && !binding.errorView.isVisible
         }
 
         override fun onCatalogReady() {
+            updateQueueControls()
             bindCatalog()
         }
 
         override fun onError(message: String) {
+            binding.loading.isVisible = false
             binding.errorText.text = message
             binding.errorView.isVisible = true
         }
@@ -138,6 +168,8 @@ class PlayerActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         Themes.apply(this)
         super.onCreate(savedInstanceState)
+        // A fresh watch page must not leave the previous pinned Activity behind.
+        PlaybackCenter.closePreviousPip()
 
         // Expands UP out of the mini player (and collapses back down).
         PanelTransitions.install(this)
@@ -176,6 +208,7 @@ class PlayerActivity : AppCompatActivity() {
             object : PlayerView.ControllerVisibilityListener {
                 override fun onVisibilityChanged(visibility: Int) {
                     controllerVisible = visibility == View.VISIBLE
+                    updateQueueControls()
                     syncFullscreenButtonVisibility()
                 }
             }
@@ -204,17 +237,34 @@ class PlayerActivity : AppCompatActivity() {
         binding.relatedList.adapter = relatedAdapter
 
         binding.retryButton.setOnClickListener { retry() }
+        // Same collapse action as NowPlayingActivity: keep the shared queue/player alive.
+        binding.backButton.setOnClickListener { finish() }
 
         binding.actionFavorite.setOnClickListener { toggleFavorite() }
         binding.actionPlaylist.setOnClickListener { showPlaylistSheet() }
         binding.actionShare.setOnClickListener { shareVideo() }
         binding.actionDownload.setOnClickListener { onDownloadClicked() }
-        binding.actionBackground.setOnClickListener {
-            PlaybackCenter.switchToAudioOnly()
-            Toast.makeText(this, R.string.background_started, Toast.LENGTH_SHORT).show()
-            finish()
+        binding.actionTimerLabel.text = com.sparktube.app.ui.music.SleepTimerSheet.buttonLabel(this)
+        binding.actionTimer.setOnClickListener {
+            com.sparktube.app.ui.music.SleepTimerSheet(this).show()
         }
         binding.actionPip.setOnClickListener { enterPipOrToast() }
+        binding.modeSwitch.setOnClickListener { openAudioView() }
+        binding.playerView.setShowRewindButton(false)
+        binding.playerView.setShowFastForwardButton(false)
+        binding.queuePrevious.setOnClickListener {
+            PlaybackCenter.previous()
+            binding.playerView.showController()
+        }
+        binding.queueNext.setOnClickListener {
+            PlaybackCenter.next()
+            binding.playerView.showController()
+        }
+        binding.queuePlayPause.setOnClickListener {
+            PlaybackCenter.togglePlayPause()
+            binding.playerView.showController()
+            updateQueueControls()
+        }
 
         binding.channelInfo.setOnClickListener { openChannel() }
         binding.subscribeButton.setOnClickListener { toggleSubscribe() }
@@ -229,37 +279,85 @@ class PlayerActivity : AppCompatActivity() {
         gestureDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onDown(e: MotionEvent): Boolean {
                 swipeTriggered = false
-                return false
+                gestureAxis = PlayerGestureMath.Axis.NONE
+                portraitGestureRejected = false
+                gestureStartPosition = PlaybackCenter.positionMs
+                pendingSeekTarget = null
+                val audio = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                gestureStartVolume = audio.getStreamVolume(AudioManager.STREAM_MUSIC)
+                gestureStartBrightness = window.attributes.screenBrightness.takeIf { it >= 0f }
+                    ?: (android.provider.Settings.System.getInt(contentResolver,
+                        android.provider.Settings.System.SCREEN_BRIGHTNESS, 128) / 255f)
+                return true
             }
 
-            override fun onScroll(
-                e1: MotionEvent?,
-                e2: MotionEvent,
-                dx: Float,
-                dy: Float
-            ): Boolean {
-                // Total drag distance from the initial touch (e1) to the
-                // current position: the per-event dy the API reports is only
-                // a few pixels per move, so a threshold on it almost never
-                // fired — the swipe-down-to-minimize felt dead.
+            override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
+                if (binding.playerView.isControllerFullyVisible) binding.playerView.hideController()
+                else binding.playerView.showController()
+                return true
+            }
+
+            override fun onDoubleTap(e: MotionEvent): Boolean {
+                // Preserve intentional double-tap seeks in both orientations.
+                if (!canSeekFromVideoSurface()) return true
+                val forward = e.x >= binding.playerView.width / 2f
+                PlaybackCenter.seekTo(PlayerGestureMath.seekTarget(PlaybackCenter.positionMs, PlaybackCenter.durationMs, forward))
+                showGestureFeedback(getString(if (forward) R.string.gesture_seek_forward else R.string.gesture_seek_back))
+                return true
+            }
+
+            override fun onScroll(e1: MotionEvent?, e2: MotionEvent, dx: Float, dy: Float): Boolean {
                 val start = e1 ?: return false
-                val totalDy = e2.y - start.y
-                val totalDx = kotlin.math.abs(e2.x - start.x)
-                if (!swipeTriggered && totalDy > SWIPE_MIN_DISTANCE && totalDy > totalDx * 1.4f) {
-                    swipeTriggered = true
-                    // Swipe down on the video collapses playback into the
-                    // mini player, like the official YouTube app: the playback
-                    // service keeps playing and MainActivity's mini player
-                    // picks the video surface up.
-                    finish()
+                val totalY = start.y - e2.y
+                val totalX = e2.x - start.x
+                if (portraitGestureRejected) return true
+                if (gestureAxis == PlayerGestureMath.Axis.NONE) {
+                    gestureAxis = PlayerGestureMath.chooseAxis(totalX, totalY, dp(14).toFloat())
+                    if (PlayerGestureMath.rejectAmbiguousPortraitMovement(
+                            gestureStartedInLandscape, totalX, totalY, dp(14).toFloat())) {
+                        portraitGestureRejected = true
+                        return true
+                    }
+                    if (gestureAxis != PlayerGestureMath.Axis.NONE) {
+                        swipeTriggered = true
+                    }
                 }
-                return false
+                if (gestureAxis == PlayerGestureMath.Axis.NONE) return true
+                if (gestureAxis == PlayerGestureMath.Axis.HORIZONTAL) {
+                    // Still consume this gesture: dragging into the bar must not
+                    // transfer ownership or synthesize a new seek-bar ACTION_DOWN.
+                    if (!canSeekFromVideoSurface()) return true
+                    val pixelsPerTenSeconds = dp(120).toFloat().coerceAtLeast(1f)
+                    pendingSeekTarget = PlayerGestureMath.horizontalSeekTarget(
+                        gestureStartPosition, PlaybackCenter.durationMs, totalX, pixelsPerTenSeconds
+                    )
+                    showGestureFeedback(formatGestureSeek(pendingSeekTarget!!))
+                    return true
+                }
+                val width = binding.playerView.width
+                // The center retains swipe-down-to-minimize; sides adjust media levels.
+                if (start.x > width * 0.35f && start.x < width * 0.65f) {
+                    if (totalY < -dp(100)) finish()
+                    return true
+                }
+                // Side brightness and volume adjustments are landscape only.
+                if (resources.configuration.orientation != Configuration.ORIENTATION_LANDSCAPE) return true
+                val fraction = totalY / (binding.playerView.height * 0.75f).coerceAtLeast(1f)
+                if (start.x >= width / 2f) {
+                    val audio = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                    val max = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                    val volume = PlayerGestureMath.volume(gestureStartVolume, fraction, max)
+                    try { audio.setStreamVolume(AudioManager.STREAM_MUSIC, volume, 0) }
+                    catch (_: SecurityException) { return true }
+                    showGestureFeedback(getString(R.string.gesture_volume, if (max > 0) volume * 100 / max else 0))
+                } else {
+                    val brightness = PlayerGestureMath.brightness(gestureStartBrightness, fraction)
+                    window.attributes = window.attributes.apply { screenBrightness = brightness }
+                    showGestureFeedback(getString(R.string.gesture_brightness, (brightness * 100).toInt()))
+                }
+                return true
             }
         })
-        binding.playerView.setOnTouchListener { v, event ->
-            gestureDetector.onTouchEvent(event)
-            v.onTouchEvent(event)
-        }
 
         hookGearMenu()
 
@@ -286,6 +384,103 @@ class PlayerActivity : AppCompatActivity() {
         }
     }
 
+    /** Keep unavailable queue actions visible but dimmed, never replace them with seek. */
+    private fun updateQueueControls() {
+        if (!::binding.isInitialized) return
+        val player = PlaybackCenter.sessionPlayer
+        listOf(
+            binding.queuePrevious to Player.COMMAND_SEEK_TO_PREVIOUS,
+            binding.queueNext to Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM
+        ).forEach { (button, command) ->
+            button.isEnabled = player.isCommandAvailable(command)
+            button.alpha = if (button.isEnabled) 1f else 0.35f
+        }
+        val playing = player.playWhenReady && player.playbackState != Player.STATE_ENDED
+        binding.queuePlayPause.setImageResource(if (playing) R.drawable.ic_pause else R.drawable.ic_play_arrow)
+        binding.queuePlayPause.contentDescription = getString(
+            if (playing) Media3R.string.exo_controls_pause_description else Media3R.string.exo_controls_play_description)
+        binding.transportControls.isVisible = controllerVisible && !isInPictureInPictureMode
+    }
+
+    private fun openAudioView() {
+        PlaybackCenter.switchToAudioOnly()
+        com.sparktube.app.ui.music.NowPlayingActivity.start(this)
+        finish()
+    }
+
+    private fun showGestureFeedback(text: String) {
+        binding.gestureFeedback.text = text
+        binding.gestureFeedback.isVisible = true
+        downloadHandler.removeCallbacks(hideGestureFeedback)
+        downloadHandler.postDelayed(hideGestureFeedback, 900)
+    }
+
+    private fun formatGestureSeek(positionMs: Long): String {
+        val seconds = positionMs / 1_000L
+        return "${seconds / 60}:${(seconds % 60).toString().padStart(2, '0')}"
+    }
+
+    private fun canSeekFromVideoSurface(): Boolean = PlayerGestureMath.canSeekVideoSurface(
+        gestureStartedInLandscape,
+        resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+    )
+
+    // Dispatch above the controller's empty scrim, but leave real buttons and the seek bar alone.
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        if (!::gestureDetector.isInitialized || isInPictureInPictureMode) return super.dispatchTouchEvent(event)
+        val point = IntArray(2)
+        binding.playerView.getLocationOnScreen(point)
+        val x = event.rawX - point[0]
+        val y = event.rawY - point[1]
+        if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+            portraitGestureRejected = false
+            gestureStartedInLandscape = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+            val inside = x >= 0 && x < binding.playerView.width && y >= 0 && y < binding.playerView.height
+            gestureTracking = inside && !hitsPlayerControl(binding.root, event.rawX.toInt(), event.rawY.toInt())
+        }
+        if (gestureTracking) {
+            val local = MotionEvent.obtain(event)
+            local.setLocation(x, y)
+            if (!gestureStartedInLandscape && (event.pointerCount > 1 ||
+                    event.actionMasked == MotionEvent.ACTION_POINTER_DOWN)) {
+                local.action = MotionEvent.ACTION_CANCEL
+                gestureDetector.onTouchEvent(local)
+                portraitGestureRejected = true
+                pendingSeekTarget = null
+            } else if (!portraitGestureRejected) {
+                gestureDetector.onTouchEvent(local)
+            }
+            local.recycle()
+            if (event.actionMasked == MotionEvent.ACTION_UP || event.actionMasked == MotionEvent.ACTION_CANCEL) {
+                if (event.actionMasked == MotionEvent.ACTION_UP && !portraitGestureRejected && canSeekFromVideoSurface()) {
+                    pendingSeekTarget?.let(PlaybackCenter::seekTo)
+                }
+                pendingSeekTarget = null
+                gestureTracking = false
+            }
+            return true
+        }
+        return super.dispatchTouchEvent(event)
+    }
+
+    private fun hitsPlayerControl(view: View, x: Int, y: Int): Boolean {
+        if (!view.isShown) return false
+        val rect = android.graphics.Rect()
+        if (!view.getGlobalVisibleRect(rect) || !rect.contains(x, y)) return false
+        if (view is DeliberateSeekTimeBar &&
+            resources.configuration.orientation != Configuration.ORIENTATION_LANDSCAPE) {
+            val location = IntArray(2)
+            view.getLocationOnScreen(location)
+            return view.hitsVisibleSeekBar((x - location[0]).toFloat(), (y - location[1]).toFloat())
+        }
+        if (view is android.widget.ImageButton || view is android.widget.Button ||
+            view is androidx.media3.ui.DefaultTimeBar || view === binding.modeSwitch) return true
+        if (view is ViewGroup) {
+            for (i in 0 until view.childCount) if (hitsPlayerControl(view.getChildAt(i), x, y)) return true
+        }
+        return false
+    }
+
     /**
      * Puts quality / speed / audio-track selection behind the gear button of
      * the player's built-in controller.
@@ -295,10 +490,14 @@ class PlayerActivity : AppCompatActivity() {
         gear?.setOnClickListener { showVideoSettingsSheet() }
     }
 
-    /** Fullscreen + scale buttons follow the built-in controller's visibility. */
+    /** All overlay buttons follow the built-in controller's visibility. */
     private fun syncFullscreenButtonVisibility() {
         val visible = !isInPictureInPictureMode && controllerVisible
+        // Single-tap reveal and auto-hide apply to collapse just like transport.
+        binding.backButton.isVisible = visible
+        binding.transportControls.isVisible = visible
         binding.fullscreenButton.isVisible = visible
+        binding.modeSwitch.isVisible = visible
         // Fit / Crop / Stretch is a fullscreen-only control: the portrait
         // box always shows the full frame, so the button stays hidden there.
         binding.scaleButton.isVisible = visible &&
@@ -339,12 +538,17 @@ class PlayerActivity : AppCompatActivity() {
             val endInset = if (rtl) bars.left else bars.right
 
             binding.backButton.updateLayoutParams<ConstraintLayout.LayoutParams> {
-                topMargin = bars.top + dp(4)
+                // Portrait playerView already clears the status bar; don't add it twice.
+                topMargin = dp(4) + if (resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) bars.top else 0
                 marginStart = dp(4) + startInset
             }
             binding.fullscreenButton.updateLayoutParams<ConstraintLayout.LayoutParams> {
-                topMargin = bars.top + dp(4)
                 marginEnd = endInset
+                bottomMargin = dp(48)
+            }
+            binding.modeSwitch.updateLayoutParams<ConstraintLayout.LayoutParams> {
+                topMargin = dp(4)
+                marginEnd = endInset + dp(4)
             }
             binding.scaleButton.updateLayoutParams<ConstraintLayout.LayoutParams> {
                 topMargin = bars.top + dp(4)
@@ -421,24 +625,25 @@ class PlayerActivity : AppCompatActivity() {
 
     override fun onStart() {
         super.onStart()
+        if (retiringPip || isFinishing) return
         PlaybackCenter.addListener(playbackListener)
+        // A visible PiP activity may be STARTED/PAUSED, never RESUMED.
+        PlaybackCenter.setPipState(binding.playerView, isInPictureInPictureMode, ::closeReplacedPip)
+        PlaybackCenter.attachView(binding.playerView)
+        updateQueueControls()
         // Playback can start resolving BEFORE this page is listening (Play
         // all / a playlist video starts the queue, then opens the page), so
         // pick the spinner state up here instead of missing it.
         binding.loading.isVisible = PlaybackCenter.isResolving && !binding.errorView.isVisible
         downloadHandler.post(downloadPoll)
-        if (PlaybackCenter.hasMedia) {
-            PlaybackCenter.player.playWhenReady = true
-        }
     }
 
     override fun onResume() {
         super.onResume()
+        if (retiringPip || isFinishing) return
         if (Themes.recreateIfNeeded(this)) return
         applyCloseTransition()
-        if (!isInPictureInPictureMode) {
-            PlaybackCenter.attachView(binding.playerView)
-        }
+        PlaybackCenter.attachView(binding.playerView)
     }
 
     // ----- Close animation -----
@@ -472,16 +677,20 @@ class PlayerActivity : AppCompatActivity() {
         }
     }
 
-    override fun onPause() {
-        super.onPause()
-        if (!isInPictureInPictureMode) {
-            PlaybackCenter.detachView(binding.playerView)
-        }
-    }
+    // Do NOT detach in onPause: Android/ROMs can pause us before delivering
+    // the PiP-mode callback. PiP stays visible while paused and needs the
+    // same TextureView output. Detach only once the activity is not visible.
 
     override fun onStop() {
         super.onStop()
+        PlaybackCenter.detachView(binding.playerView)
+        // A stopped/temporarily hidden pinned Activity still needs to be
+        // reachable for replacement cleanup; only a real exit releases it.
+        if (!isInPictureInPictureMode || isFinishing || retiringPip) {
+            PlaybackCenter.setPipState(binding.playerView, false)
+        }
         downloadHandler.removeCallbacks(downloadPoll)
+        downloadHandler.removeCallbacks(hideGestureFeedback)
         PlaybackCenter.removeListener(playbackListener)
         // Return to sensor portrait so the next video starts the standard way.
         if (requestedOrientation != ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED) {
@@ -489,10 +698,27 @@ class PlayerActivity : AppCompatActivity() {
         }
     }
 
+    override fun onDestroy() {
+        PlaybackCenter.setPipState(binding.playerView, false)
+        PlaybackCenter.detachView(binding.playerView)
+        super.onDestroy()
+    }
+
     // ----- PiP -----
+
+    private fun closeReplacedPip() {
+        if (retiringPip) return
+        retiringPip = true
+        PlaybackCenter.removeListener(playbackListener)
+        PlaybackCenter.detachView(binding.playerView)
+        // Finish the pinned Activity itself, not just its surface or global flag.
+        // Never stop/pause the shared engine: it is about to play the new item.
+        finish()
+    }
 
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
+        if (retiringPip || isFinishing) return
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && PlaybackCenter.hasMedia &&
             PlaybackCenter.mode == PlaybackCenter.Mode.VIDEO && !PlaybackCenter.audioOnlyMode
         ) {
@@ -509,7 +735,7 @@ class PlayerActivity : AppCompatActivity() {
     }
 
     private fun enterPip() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || retiringPip || isFinishing) return
         try {
             enterPictureInPictureMode(
                 android.app.PictureInPictureParams.Builder()
@@ -526,30 +752,34 @@ class PlayerActivity : AppCompatActivity() {
         newConfig: Configuration
     ) {
         super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
-        PlaybackCenter.inPip = isInPictureInPictureMode
-        if (isInPictureInPictureMode) {
-            // Show the video only: no back button, no fullscreen button, no page.
-            binding.backButton.isVisible = false
-            binding.fullscreenButton.isVisible = false
-            binding.scaleButton.isVisible = false
-            binding.scrollArea.isVisible = false
-            binding.loading.isVisible = false
-            binding.errorView.isVisible = false
-            // Expand player to the whole window
-            binding.playerView.updateLayoutParams<ConstraintLayout.LayoutParams> {
-                height = ViewGroup.LayoutParams.MATCH_PARENT
-                dimensionRatio = null
-            }
-            // The PiP window has no insets — clear the portrait offset.
-            applyPlayerTopInset()
-        } else {
-            binding.scrollArea.isVisible = true
-            binding.playerView.updateLayoutParams<ConstraintLayout.LayoutParams> {
-                height = 0
-                dimensionRatio = "16:9"
-            }
-            applyPlayerTopInset()
-            syncFullscreenButtonVisibility()
+        if (retiringPip || isFinishing) return
+        PlaybackCenter.setPipState(binding.playerView, isInPictureInPictureMode, ::closeReplacedPip)
+        // Recover ownership even if pause/configuration callbacks arrived
+        // first. attachView is idempotent and uses the raw rendering player.
+        if (isInPictureInPictureMode) PlaybackCenter.attachView(binding.playerView)
+        binding.playerView.useController = !isInPictureInPictureMode
+        applyOrientation(newConfig)
+        if (!isInPictureInPictureMode) binding.playerView.showController()
+    }
+
+    private fun applyPipLayout() {
+        // Both mode and configuration callbacks use this path: orientation
+        // must never restore the watch page over the tiny PiP video output.
+        binding.transportControls.isVisible = false
+        binding.playerView.hideController()
+        binding.backButton.isVisible = false
+        binding.fullscreenButton.isVisible = false
+        binding.scaleButton.isVisible = false
+        binding.modeSwitch.isVisible = false
+        binding.gestureFeedback.isVisible = false
+        binding.scrollArea.isVisible = false
+        binding.loading.isVisible = false
+        binding.errorView.isVisible = false
+        binding.playerView.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+        binding.playerView.updateLayoutParams<ConstraintLayout.LayoutParams> {
+            height = ViewGroup.LayoutParams.MATCH_PARENT
+            dimensionRatio = null
+            topMargin = 0
         }
     }
 
@@ -561,7 +791,36 @@ class PlayerActivity : AppCompatActivity() {
     }
 
     private fun applyOrientation(config: Configuration) {
+        if (isInPictureInPictureMode) {
+            applyPipLayout()
+            return
+        }
         val landscape = config.orientation == Configuration.ORIENTATION_LANDSCAPE
+        if (!landscape) {
+            // Do not carry a fullscreen-only brightness override back to portrait.
+            window.attributes = window.attributes.apply {
+                screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+            }
+            binding.gestureFeedback.isVisible = false
+        }
+        // This activity handles rotation without reinflating the controller.
+        // Clear only the portrait bottom strip; restore Media3's original
+        // background in landscape without changing seek layout or behavior.
+        binding.playerView.findViewById<View>(Media3R.id.exo_bottom_bar)?.setBackgroundResource(
+            if (landscape) Media3R.color.exo_bottom_bar_background else android.R.color.transparent
+        )
+        // The portrait-only dimension is also read by Media3's layout manager,
+        // so resizing cannot put the old 52dp gap back. Apply it immediately
+        // on rotation too, before the next controller size/layout callback.
+        binding.playerView.findViewById<View>(Media3R.id.exo_progress)
+            ?.updateLayoutParams<ViewGroup.MarginLayoutParams> {
+                bottomMargin = resources.getDimensionPixelSize(Media3R.dimen.exo_styled_progress_margin_bottom)
+            }
+        // Keep settings clickable above the lowered 48dp seek touch target.
+        // Empty transparent row space still passes touches through to the bar.
+        // Restore the original zero Z/order for landscape controls.
+        binding.playerView.findViewById<View>(Media3R.id.exo_bottom_bar)?.translationZ =
+            if (landscape) 0f else dp(1).toFloat()
         binding.fullscreenButton.setImageResource(
             if (landscape) R.drawable.ic_fullscreen_exit else R.drawable.ic_fullscreen
         )
@@ -841,7 +1100,7 @@ class PlayerActivity : AppCompatActivity() {
                 confirmDeleteDownload()
             }
             DownloadCenter.hasActiveDownload(this, entry.url) -> {
-                Toast.makeText(this, R.string.download_status_running, Toast.LENGTH_SHORT).show()
+                com.sparktube.app.ui.MainActivity.openDownloads(this)
             }
             else -> showDownloadSheet()
         }
@@ -997,6 +1256,8 @@ class PlayerActivity : AppCompatActivity() {
 
     private val downloadPoll = object : Runnable {
         override fun run() {
+            binding.actionTimerLabel.text = com.sparktube.app.ui.music.SleepTimerSheet.buttonLabel(this@PlayerActivity)
+            binding.actionTimer.contentDescription = com.sparktube.app.ui.music.SleepTimerSheet.accessibilityLabel(this@PlayerActivity)
             val entry = PlaybackCenter.currentEntry
             if (entry != null && !isFinishing) {
                 // Keep the registry in sync with the built-in download
@@ -1078,10 +1339,7 @@ class PlayerActivity : AppCompatActivity() {
 
     private fun retry() {
         binding.errorView.isVisible = false
-        val entry = PlaybackCenter.currentEntry
-        if (entry != null) {
-            PlaybackCenter.playVideo(entry)
-        }
+        PlaybackCenter.retryCurrentVideo()
     }
 
     // ----- Bottom sheets -----

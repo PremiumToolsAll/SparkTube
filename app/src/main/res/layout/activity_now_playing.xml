@@ -35,9 +35,51 @@
         android:textSize="11sp"
         android:textStyle="bold"
         app:layout_constraintBottom_toBottomOf="@id/backButton"
-        app:layout_constraintEnd_toStartOf="@id/queueButton"
+        app:layout_constraintEnd_toStartOf="@id/modeSwitch"
         app:layout_constraintStart_toEndOf="@id/backButton"
         app:layout_constraintTop_toTopOf="@id/backButton" />
+
+    <LinearLayout
+        android:id="@+id/modeSwitch"
+        android:layout_width="76dp"
+        android:layout_height="48dp"
+        android:layout_marginTop="4dp"
+        android:gravity="center"
+        android:orientation="horizontal"
+        android:background="@drawable/bg_mode_switch_hit_area"
+        android:contentDescription="@string/switch_to_video"
+        android:clickable="true"
+        android:focusable="true"
+        app:layout_constraintEnd_toStartOf="@id/queueButton"
+        app:layout_constraintTop_toTopOf="parent">
+
+        <FrameLayout
+            android:layout_width="30dp"
+            android:layout_height="24dp"
+            android:background="@drawable/bg_mode_switch_active"
+            android:importantForAccessibility="no">
+            <ImageView
+                android:layout_width="17dp"
+                android:layout_height="17dp"
+                android:layout_gravity="center"
+                android:importantForAccessibility="no"
+                android:src="@drawable/ic_headset"
+                app:tint="@color/white" />
+        </FrameLayout>
+
+        <FrameLayout
+            android:layout_width="30dp"
+            android:layout_height="24dp"
+            android:importantForAccessibility="no">
+            <ImageView
+                android:layout_width="17dp"
+                android:layout_height="17dp"
+                android:layout_gravity="center"
+                android:importantForAccessibility="no"
+                android:src="@drawable/ic_play_arrow"
+                app:tint="@color/nav_inactive" />
+        </FrameLayout>
+    </LinearLayout>
 
     <ImageButton
         android:id="@+id/queueButton"
@@ -207,7 +249,7 @@
                 app:tint="@color/on_surface" />
         </LinearLayout>
 
-        <!-- Radio · Download -->
+        <!-- Radio · Download · Timer: one shared timer, directly after Download. -->
         <LinearLayout
             android:id="@+id/actionsRow"
             android:layout_width="match_parent"
@@ -235,6 +277,27 @@
                 android:contentDescription="@string/action_download"
                 android:src="@drawable/ic_download"
                 app:tint="@color/on_surface" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/timerButton"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                android:layout_width="0dp"
+                android:layout_height="52dp"
+                android:layout_weight="1"
+                android:minWidth="0dp"
+                android:paddingStart="4dp"
+                android:paddingEnd="4dp"
+                android:singleLine="true"
+                android:text="@string/sleep_timer_button"
+                android:textSize="12sp"
+                android:textColor="@color/music_green"
+                app:cornerRadius="26dp"
+                app:icon="@drawable/ic_sleep_timer"
+                app:iconGravity="textStart"
+                app:iconPadding="4dp"
+                app:iconSize="20dp"
+                app:iconTint="@color/music_green"
+                app:strokeColor="@color/music_green" />
         </LinearLayout>
 
         <TextView
@@ -246,6 +309,8 @@
             android:textColor="@color/on_surface_variant"
             android:textSize="13sp"
             android:visibility="gone" />
+
+
 
         <!-- Up next: opens the full queue so radio songs can be picked. -->
         <LinearLayout

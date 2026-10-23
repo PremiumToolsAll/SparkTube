@@ -49,6 +49,20 @@
         app:layout_constraintTop_toBottomOf="@id/thumbWrap"
         app:shapeAppearanceOverlay="@style/CircleImage" />
 
+    <androidx.appcompat.widget.AppCompatImageButton
+        android:id="@+id/overflowButton"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
+        android:layout_marginTop="2dp"
+        android:background="?attr/selectableItemBackgroundBorderless"
+        android:contentDescription="@string/video_options"
+        android:padding="12dp"
+        android:scaleType="centerInside"
+        app:srcCompat="@drawable/ic_download_more"
+        app:tint="@color/on_surface"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintTop_toBottomOf="@id/thumbWrap" />
+
     <TextView
         android:id="@+id/title"
         android:layout_width="0dp"
@@ -61,7 +75,7 @@
         android:textColor="@color/on_surface"
         android:textSize="15sp"
         android:textStyle="bold"
-        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintEnd_toStartOf="@id/overflowButton"
         app:layout_constraintStart_toEndOf="@id/avatar"
         app:layout_constraintTop_toBottomOf="@id/thumbWrap" />
 
@@ -78,7 +92,7 @@
         android:textColor="@color/on_surface_variant"
         android:textSize="12sp"
         app:layout_constraintBottom_toBottomOf="parent"
-        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintEnd_toStartOf="@id/overflowButton"
         app:layout_constraintStart_toEndOf="@id/avatar"
         app:layout_constraintTop_toBottomOf="@id/title" />
 </androidx.constraintlayout.widget.ConstraintLayout>

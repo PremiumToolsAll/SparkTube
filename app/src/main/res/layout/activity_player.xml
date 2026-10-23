@@ -16,20 +16,123 @@
         app:layout_constraintTop_toTopOf="parent"
         app:resize_mode="fit"
         app:surface_type="texture_view"
+        app:controller_layout_id="@layout/player_queue_controller"
+        app:animation_enabled="false"
         app:use_controller="true" />
+
+    <!-- Outside PlayerControlView: its minimal-mode/layout manager cannot hide or resize these. -->
+    <LinearLayout
+        android:id="@+id/transportControls"
+        android:layout_width="wrap_content"
+        android:layout_height="76dp"
+        android:orientation="horizontal"
+        android:gravity="center"
+        android:layoutDirection="ltr"
+        android:visibility="gone"
+        app:layout_constraintStart_toStartOf="@id/playerView"
+        app:layout_constraintEnd_toEndOf="@id/playerView"
+        app:layout_constraintTop_toTopOf="@id/playerView"
+        app:layout_constraintBottom_toBottomOf="@id/playerView">
+        <androidx.appcompat.widget.AppCompatImageButton
+            android:id="@+id/queuePrevious"
+            android:layout_width="52dp"
+            android:layout_height="52dp"
+            android:layout_marginEnd="24dp"
+            android:background="@drawable/bg_transport_circle"
+            android:padding="12dp"
+            android:src="@drawable/ic_skip_previous"
+            android:contentDescription="@string/exo_controls_previous_description"
+            app:tint="@color/white" />
+        <androidx.appcompat.widget.AppCompatImageButton
+            android:id="@+id/queuePlayPause"
+            android:layout_width="76dp"
+            android:layout_height="76dp"
+            android:background="@drawable/bg_transport_circle"
+            android:padding="14dp"
+            android:src="@drawable/ic_play_arrow"
+            android:contentDescription="@string/exo_controls_play_description"
+            app:tint="@color/white" />
+        <androidx.appcompat.widget.AppCompatImageButton
+            android:id="@+id/queueNext"
+            android:layout_width="52dp"
+            android:layout_height="52dp"
+            android:layout_marginStart="24dp"
+            android:background="@drawable/bg_transport_circle"
+            android:padding="12dp"
+            android:src="@drawable/ic_skip_next"
+            android:contentDescription="@string/exo_controls_next_description"
+            app:tint="@color/white" />
+    </LinearLayout>
 
     <ImageButton
         android:id="@+id/backButton"
         android:layout_width="48dp"
         android:layout_height="48dp"
         android:layout_marginStart="4dp"
-        android:background="@drawable/bg_icon_scrim"
-        android:contentDescription="@string/app_name"
-        android:src="@drawable/ic_arrow_back"
-        android:visibility="gone"
-        app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintTop_toTopOf="parent"
+        android:layout_marginTop="4dp"
+        android:background="@android:color/transparent"
+        android:contentDescription="@string/collapse_video_player"
+        android:rotation="90"
+        android:src="@drawable/ic_chevron_right"
+        app:layout_constraintStart_toStartOf="@id/playerView"
+        app:layout_constraintTop_toTopOf="@id/playerView"
         app:tint="@color/white" />
+
+    <LinearLayout
+        android:id="@+id/modeSwitch"
+        android:layout_width="76dp"
+        android:layout_height="48dp"
+        android:gravity="center"
+        android:orientation="horizontal"
+        android:background="@drawable/bg_mode_switch_hit_area"
+        android:contentDescription="@string/switch_to_audio"
+        android:clickable="true"
+        android:focusable="true"
+        app:layout_constraintEnd_toEndOf="@id/playerView"
+        app:layout_constraintTop_toTopOf="@id/playerView">
+
+        <FrameLayout
+            android:layout_width="30dp"
+            android:layout_height="24dp"
+            android:importantForAccessibility="no">
+            <ImageView
+                android:layout_width="17dp"
+                android:layout_height="17dp"
+                android:layout_gravity="center"
+                android:importantForAccessibility="no"
+                android:src="@drawable/ic_headset"
+                app:tint="@color/nav_inactive" />
+        </FrameLayout>
+
+        <FrameLayout
+            android:layout_width="30dp"
+            android:layout_height="24dp"
+            android:background="@drawable/bg_mode_switch_active"
+            android:importantForAccessibility="no">
+            <ImageView
+                android:layout_width="17dp"
+                android:layout_height="17dp"
+                android:layout_gravity="center"
+                android:importantForAccessibility="no"
+                android:src="@drawable/ic_play_arrow"
+                app:tint="@color/white" />
+        </FrameLayout>
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/gestureFeedback"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:padding="12dp"
+        android:background="@drawable/bg_icon_scrim"
+        android:textColor="@color/white"
+        android:textSize="16sp"
+        android:visibility="gone"
+        android:importantForAccessibility="no"
+        app:layout_constraintStart_toStartOf="@id/playerView"
+        app:layout_constraintEnd_toEndOf="@id/playerView"
+        app:layout_constraintTop_toTopOf="@id/playerView"
+        app:layout_constraintBottom_toBottomOf="@id/playerView" />
 
     <ImageButton
         android:id="@+id/fullscreenButton"
@@ -38,8 +141,8 @@
         android:background="@drawable/bg_icon_scrim"
         android:contentDescription="@string/action_fullscreen"
         android:src="@drawable/ic_expand"
-        app:layout_constraintEnd_toEndOf="parent"
-        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintEnd_toEndOf="@id/playerView"
+        app:layout_constraintBottom_toBottomOf="@id/playerView"
         app:tint="@color/white" />
 
     <ImageButton
@@ -49,7 +152,7 @@
         android:background="@drawable/bg_icon_scrim"
         android:contentDescription="@string/action_scale_mode"
         android:src="@drawable/ic_tune"
-        app:layout_constraintEnd_toStartOf="@id/fullscreenButton"
+        app:layout_constraintEnd_toStartOf="@id/modeSwitch"
         app:layout_constraintTop_toTopOf="parent"
         app:tint="@color/white" />
 
@@ -274,17 +377,18 @@
                     </LinearLayout>
 
                     <LinearLayout
-                        android:id="@+id/actionBackground"
+                        android:id="@+id/actionTimer"
                         style="@style/ActionPill">
 
                         <ImageView
                             style="@style/ActionPillIcon"
-                            android:src="@drawable/ic_headset"
+                            android:src="@drawable/ic_sleep_timer"
                             app:tint="@color/on_surface" />
 
                         <TextView
                             style="@style/ActionPillText"
-                            android:text="@string/action_background" />
+                            android:id="@+id/actionTimerLabel"
+                            android:text="@string/sleep_timer_button" />
                     </LinearLayout>
 
                     <LinearLayout
@@ -456,7 +560,6 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
-            android:text="@string/retry"
-            android:visibility="gone" />
+            android:text="@string/retry" />
     </LinearLayout>
 </androidx.constraintlayout.widget.ConstraintLayout>

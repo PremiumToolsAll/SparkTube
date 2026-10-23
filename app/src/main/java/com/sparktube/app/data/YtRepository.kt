@@ -116,24 +116,17 @@ object YtRepository {
         NewPipe.setPreferredContentCountry(ContentCountry(countryCode))
     }
 
-    /** Country based suggestion feed used on the Home tab. */
-    suspend fun trending(countryCode: String): List<StreamInfoItem> =
+    /** Country feed; first useful cards can render before all three kiosks finish. */
+    suspend fun trending(
+        countryCode: String,
+        onInitialItems: suspend (List<StreamInfoItem>) -> Unit = {}
+    ): List<StreamInfoItem> =
         withContext(Dispatchers.IO) {
             NewPipe.setPreferredContentCountry(ContentCountry(countryCode))
 
-            var lastError: Exception? = null
-            val lists = HOME_KIOSKS.mapNotNull { kioskId ->
-                try {
-                    fetchKiosk(kioskId)
-                } catch (e: Exception) {
-                    lastError = e
-                    emptyList()
-                }
-            }.filter { it.isNotEmpty() }
-
-            if (lists.isEmpty()) {
-                throw lastError ?: IOException("No content available for this region")
-            }
+            val loaders: List<suspend () -> List<StreamInfoItem>> =
+                HOME_KIOSKS.map { kioskId -> suspend { fetchKiosk(kioskId) } }
+            val lists = ProgressiveFeedLoader.load(loaders, onInitialItems)
 
             // Round-robin blend so the feed feels varied and general.
             val blended = mutableListOf<StreamInfoItem>()
@@ -173,9 +166,10 @@ object YtRepository {
      */
     suspend fun personalizedFeed(
         countryCode: String,
-        snap: RecommendEngine.Snapshot
+        snap: RecommendEngine.Snapshot,
+        onInitialItems: suspend (List<StreamInfoItem>) -> Unit = {}
     ): List<StreamInfoItem> = withContext(Dispatchers.IO) {
-        val trending = trending(countryCode)
+        val trending = trending(countryCode, onInitialItems)
         if (!snap.hasSignal) {
             return@withContext trending
         }
